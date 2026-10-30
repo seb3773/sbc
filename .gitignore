@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+dist/
+*.o
+*.deb
+.tmp_*
+/sbc
+/sbc.exe
+/unsbc.exe
+/tools
+
+# Temporary test archives
+*.sbc
+!packed_corpus/*.sbc
+
+# Work & scratch directories (Reverse-engineering, logs, traces, wine)
+_work/
+.backup/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class

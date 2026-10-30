@@ -30,6 +30,14 @@ for arg in "$@"; do
             make test
             exit 0
             ;;
+        deb)
+            make deb
+            exit 0
+            ;;
+        dist)
+            make dist
+            exit 0
+            ;;
         help|-h|--help)
             make help
             exit 0

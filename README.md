@@ -64,6 +64,8 @@ make                  # Compile Linux binary (-O3 -flto)
 make win64            # Cross-compile Windows 64-bit static binary
 make all-platforms    # Build all targets
 make test             # Run self-test and corpus test suites
+make deb              # Build standalone Debian .deb package
+make dist             # Build complete release distribution (.tar.gz, .zip, .deb)
 make clean            # Remove build directory
 sudo make install     # Install to /usr/local/bin
 ```
@@ -150,8 +152,10 @@ sbc <command> [options] <archive.sbc> [files...]
 
 ```
 sbc/
-├── Makefile                # Standard build file (all, win64, test, clean)
+├── Makefile                # Standard build file (all, win64, test, deb, dist, clean)
 ├── build.sh                # Unified helper script for compilation & tests
+├── build_deb.sh            # Debian package builder (.deb)
+├── build_dist.sh           # Distribution packager (.deb, .tar.gz, .zip)
 ├── .gitignore              # Ignores build artifacts, scratch and _work
 ├── README.md               # Project documentation and benchmarks
 ├── FORMAT.md               # Comprehensive binary archive format specification

@@ -17,7 +17,7 @@ DESTDIR ?=
 SRC_FILES = src/sbc.c
 SRC_HEADERS = $(wildcard src/*.h)
 
-.PHONY: all linux win64 all-platforms clean install uninstall test help debug
+.PHONY: all linux win64 all-platforms clean install uninstall deb dist test help debug
 
 all: linux
 
@@ -56,8 +56,16 @@ test: $(TARGET_LINUX)
 	python3 tests/vendor_parity.py
 	@echo "All tests passed successfully."
 
+deb:
+	@chmod +x build_deb.sh
+	./build_deb.sh
+
+dist:
+	@chmod +x build_dist.sh
+	./build_dist.sh
+
 clean:
-	rm -rf $(BUILD_DIR) sbc
+	rm -rf $(BUILD_DIR) sbc dist *.deb
 
 install: $(TARGET_LINUX)
 	install -d $(DESTDIR)$(PREFIX)/bin
@@ -73,6 +81,8 @@ help:
 	@echo "  make all-platforms - Build both Linux and Windows 64-bit binaries"
 	@echo "  make debug         - Build Linux binary with debug symbols (-g -O0)"
 	@echo "  make test          - Run self-test and verification test suite"
+	@echo "  make deb           - Build standalone Debian .deb package"
+	@echo "  make dist          - Build full release distribution (tar.gz, zip, deb)"
 	@echo "  make install       - Install sbc to $(DESTDIR)$(PREFIX)/bin"
 	@echo "  make uninstall     - Remove sbc from $(DESTDIR)$(PREFIX)/bin"
 	@echo "  make clean         - Remove build artifacts"

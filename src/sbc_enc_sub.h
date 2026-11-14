@@ -108,6 +108,13 @@ static size_t sbc_enc_sub_compress(const uint8_t *src, size_t n, uint8_t *dst,
     }
     ip = pro;
     op = pro;
+    {
+        static const char *subdbg;
+        static int subdbg_ready;
+        if (!subdbg_ready) {
+            subdbg = getenv("SBC_SUBDBG");
+            subdbg_ready = 1;
+        }
     while (ip < n) {
         uint32_t h, pos, words;
         size_t avail;
@@ -122,15 +129,13 @@ static size_t sbc_enc_sub_compress(const uint8_t *src, size_t n, uint8_t *dst,
                  ((uint32_t)src[ip - 2] << 8) ^ (uint32_t)src[ip - 1]) & mask;
         }
         pos = g_sub.table[h];
-        if (getenv("SBC_SUBDBG") && ip < 32)
+        if (subdbg && ip < 32)
             fprintf(stderr, "ip=%zu h=%u pos=%u ring=%02x%02x%02x%02x "
                     "src=%02x%02x%02x%02x\n", ip, h, pos, ring[pos],
                     ring[pos + 1], ring[pos + 2], ring[pos + 3], src[ip],
                     src[ip + 1], src[ip + 2], src[ip + 3]);
         words = 0;
-        if (sbc_enc_sub_ld32(ring + pos) == sbc_enc_sub_ld32(src + ip) &&
-            sbc_enc_sub_ld32(ring + pos + 4) ==
-            sbc_enc_sub_ld32(src + ip + 4)) {
+        if (sbc_ld64(ring + pos) == sbc_ld64(src + ip)) {
             avail = (n - ip) / 4;
             if (avail > maxlen)
                 avail = maxlen;
@@ -141,6 +146,13 @@ static size_t sbc_enc_sub_compress(const uint8_t *src, size_t n, uint8_t *dst,
                 c = pos + 4 * words;
                 if (c >= size)
                     c -= size * (c / size);
+                if (words + 1 < avail &&
+                    sbc_ld64(ring + c) == sbc_ld64(src + ip + 4 * words)) {
+                    words++;
+                    if (words >= avail)
+                        break;
+                    continue;
+                }
                 if (sbc_enc_sub_ld32(ring + c) !=
                     sbc_enc_sub_ld32(src + ip + 4 * words))
                     break;
@@ -188,18 +200,19 @@ static size_t sbc_enc_sub_compress(const uint8_t *src, size_t n, uint8_t *dst,
         }
         if (ip >= n) {
             if (op >= limit) {
-                if (getenv("SBC_SUBDBG"))
+                if (subdbg)
                     fprintf(stderr, "subend op=%zu limit=%zu\n", op, limit);
                 return 0;
             }
             break;
         }
         if (op >= limit) {
-            if (getenv("SBC_SUBDBG"))
+            if (subdbg)
                 fprintf(stderr, "subfull op=%zu limit=%zu ip=%zu\n", op,
                         limit, ip);
             return 0;
         }
+    }
     }
     if (op >= limit)
         return 0;

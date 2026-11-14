@@ -15,6 +15,109 @@
 #define SBC_ENC_BLOCK_H
 
 typedef struct {
+    const uint8_t *src;
+    size_t n;
+    int level;
+    int used;
+    uint8_t *buf;
+    size_t len;
+    int verdict;
+    int ok;
+    long t54, t6c, t70;
+    long cnt_a, cnt_b, fam_a, fam_b;
+    long slot[12];
+} SbcPolCache;
+
+static SbcPolCache sbc_pol_cache;
+
+typedef struct {
+    const uint8_t *src;
+    size_t n;
+    int used;
+    uint8_t *buf;
+    size_t len;
+} SbcM6Cache;
+
+static SbcM6Cache sbc_m6_cache;
+
+typedef struct {
+    const uint8_t *src;
+    size_t n;
+    uint32_t ctrl;
+    int used;
+    uint8_t *buf;
+    size_t len;
+    uint8_t *code;
+    size_t coden;
+} SbcM4Cache;
+
+static SbcM4Cache sbc_m4_cache;
+
+static void sbc_m6_cache_clear(void)
+{
+    free(sbc_m6_cache.buf);
+    memset(&sbc_m6_cache, 0, sizeof(sbc_m6_cache));
+}
+
+static void sbc_m4_cache_clear(void)
+{
+    free(sbc_m4_cache.buf);
+    free(sbc_m4_cache.code);
+    memset(&sbc_m4_cache, 0, sizeof(sbc_m4_cache));
+}
+
+static void sbc_m4_cache_take(const uint8_t *src, size_t n, uint32_t ctrl,
+                              uint8_t *buf, size_t len, uint8_t *code,
+                              size_t coden)
+{
+    sbc_m4_cache_clear();
+    sbc_m4_cache.src = src;
+    sbc_m4_cache.n = n;
+    sbc_m4_cache.ctrl = ctrl;
+    sbc_m4_cache.buf = buf;
+    sbc_m4_cache.len = len;
+    sbc_m4_cache.code = code;
+    sbc_m4_cache.coden = coden;
+}
+
+static void sbc_m6_cache_take(const uint8_t *src, size_t n, uint8_t *buf,
+                              size_t len)
+{
+    sbc_m6_cache_clear();
+    sbc_m6_cache.src = src;
+    sbc_m6_cache.n = n;
+    sbc_m6_cache.buf = buf;
+    sbc_m6_cache.len = len;
+}
+
+static void sbc_pol_cache_clear(void)
+{
+    free(sbc_pol_cache.buf);
+    memset(&sbc_pol_cache, 0, sizeof(sbc_pol_cache));
+}
+
+static void sbc_pol_cache_take(const uint8_t *src, size_t n, int level,
+                               uint8_t *buf, size_t len)
+{
+    sbc_pol_cache_clear();
+    sbc_pol_cache.src = src;
+    sbc_pol_cache.n = n;
+    sbc_pol_cache.level = level;
+    sbc_pol_cache.len = len;
+    sbc_pol_cache.buf = buf;
+    sbc_pol_cache.verdict = sbc_enc_m0_verdict;
+    sbc_pol_cache.ok = sbc_enc_m0_ok;
+    sbc_pol_cache.t54 = sbc_m0a_last_t54;
+    sbc_pol_cache.t6c = sbc_m0a_last_t6c;
+    sbc_pol_cache.t70 = sbc_m0a_last_t70;
+    sbc_pol_cache.cnt_a = sbc_m0a_last_cnt_a;
+    sbc_pol_cache.cnt_b = sbc_m0a_last_cnt_b;
+    sbc_pol_cache.fam_a = sbc_m0a_last_fam_a;
+    sbc_pol_cache.fam_b = sbc_m0a_last_fam_b;
+    memcpy(sbc_pol_cache.slot, sbc_m0a_last_slot, sizeof(sbc_pol_cache.slot));
+}
+
+typedef struct {
     uint8_t *filter;
     size_t flen;
     uint8_t *lzp;
@@ -81,51 +184,113 @@ static int sbc_enc_filter(const uint8_t *data, size_t n, int level, int mode,
                           size_t *outn, uint8_t **codep, size_t *coden,
                           uint32_t *m6tab, size_t m6base)
 {
-    uint8_t *r = (uint8_t *)malloc(n ? n : 1);
+    uint8_t *r;
     if (codep)
         *codep = NULL;
     if (coden)
         *coden = 0;
+    if (mode == 0 && sbc_pol_cache.buf && !sbc_pol_cache.used &&
+        sbc_pol_cache.src == data && sbc_pol_cache.n == n &&
+        sbc_pol_cache.level == level && sbc_pol_cache.len == n) {
+        r = sbc_pol_cache.buf;
+        sbc_pol_cache.buf = NULL;
+        sbc_pol_cache.used = 1;
+        sbc_enc_m0_verdict = sbc_pol_cache.verdict;
+        sbc_enc_m0_ok = sbc_pol_cache.ok;
+        sbc_m0a_last_t54 = sbc_pol_cache.t54;
+        sbc_m0a_last_t6c = sbc_pol_cache.t6c;
+        sbc_m0a_last_t70 = sbc_pol_cache.t70;
+        sbc_m0a_last_cnt_a = sbc_pol_cache.cnt_a;
+        sbc_m0a_last_cnt_b = sbc_pol_cache.cnt_b;
+        sbc_m0a_last_fam_a = sbc_pol_cache.fam_a;
+        sbc_m0a_last_fam_b = sbc_pol_cache.fam_b;
+        memcpy(sbc_m0a_last_slot, sbc_pol_cache.slot,
+               sizeof(sbc_m0a_last_slot));
+        *outp = r;
+        *outn = n;
+        return 0;
+    }
+    r = (uint8_t *)malloc(n ? n : 1);
     if (!r)
         return -1;
     if (mode == 5) {
         memcpy(r, data, n);
     } else if (mode == 4) {
         free(r);
+        if (sbc_m4_cache.buf && !sbc_m4_cache.used &&
+            sbc_m4_cache.src == data && sbc_m4_cache.n == n &&
+            sbc_m4_cache.ctrl == ctrl) {
+            *outp = sbc_m4_cache.buf;
+            *outn = sbc_m4_cache.len;
+            sbc_m4_cache.buf = NULL;
+            sbc_m4_cache.used = 1;
+            if (codep) {
+                *codep = sbc_m4_cache.code;
+                sbc_m4_cache.code = NULL;
+            } else {
+                free(sbc_m4_cache.code);
+                sbc_m4_cache.code = NULL;
+            }
+            if (coden)
+                *coden = sbc_m4_cache.coden;
+            sbc_m4_cache.coden = 0;
+            return 0;
+        }
         return sbc_enc_mode4(data, n, ctrl, outp, outn, codep, coden);
     } else if (mode == 6) {
         free(r);
         if (m6tab)
             return sbc_enc_mode6_abs(data, n, m6base, m6tab, outp, outn);
+        if (sbc_m6_cache.buf && !sbc_m6_cache.used &&
+            sbc_m6_cache.src == data && sbc_m6_cache.n == n) {
+            *outp = sbc_m6_cache.buf;
+            *outn = sbc_m6_cache.len;
+            sbc_m6_cache.buf = NULL;
+            sbc_m6_cache.used = 1;
+            return 0;
+        }
         return sbc_enc_mode6(data, n, outp, outn);
     } else if (mode == 0) {
-        /* SBC_M0IN dumps what the filter really sees: the second-stage stream
-         * at -m2/-m3, which is what the vendor's own filter consumes. */
-        const char *m0in = getenv("SBC_M0IN");
-        if (m0in) {
-            FILE *mf = fopen(m0in, "wb");
-            if (mf) {
-                fwrite(data, 1, n, mf);
-                fclose(mf);
+        {
+            static const char *m0in;
+            static int m0in_ready;
+            if (!m0in_ready) {
+                m0in = getenv("SBC_M0IN");
+                m0in_ready = 1;
             }
+            if (m0in) {
+                FILE *mf = fopen(m0in, "wb");
+                if (mf) {
+                    fwrite(data, 1, n, mf);
+                    fclose(mf);
+                }
+            }
+            if (level <= 0)
+                sbc_enc_mode0_simple(data, n, r);
+            else if (level == 1)
+                sbc_enc_mode0_adaptive(data, n, &sbc_m0_params_l1, r);
+            else
+                sbc_enc_mode0_adaptive(data, n, &sbc_m0_params_l2, r);
         }
-        if (level <= 0)
-            sbc_enc_mode0_simple(data, n, r);
-        else if (level == 1)
-            sbc_enc_mode0_adaptive(data, n, &sbc_m0_params_l1, r);
-        else
-            sbc_enc_mode0_adaptive(data, n, &sbc_m0_params_l2, r);
     } else if (mode == 7) {
         sbc_enc_mode7(data, n, m7param, r);
     } else {
         free(r);
         return -1;
     }
-    if (getenv("SBC_FOUT")) {
-        FILE *ff = fopen(getenv("SBC_FOUT"), "wb");
-        if (ff) {
-            fwrite(r, 1, n, ff);
-            fclose(ff);
+    {
+        static const char *fout;
+        static int fout_ready;
+        if (!fout_ready) {
+            fout = getenv("SBC_FOUT");
+            fout_ready = 1;
+        }
+        if (fout) {
+            FILE *ff = fopen(fout, "wb");
+            if (ff) {
+                fwrite(r, 1, n, ff);
+                fclose(ff);
+            }
         }
     }
     *outp = r;
@@ -278,16 +443,17 @@ static int sbc_enc_pipeline_plan(SbcEncBlock *b, const uint8_t *data,
     rc = sbc_lzp_encode(b->filter, b->flen, b->lzp, cap, &b->lzplen, &pp);
     if (rc == 0 && b->lzplen < b->flen) {
         b->flag3 = 1;
+        b->bwt = sbc_bwt(b->lzp, b->lzplen, &b->primary);
     } else {
         b->flag3 = 0;
-        memcpy(b->lzp, b->filter, b->flen);
         b->lzplen = b->flen;
+        b->bwt = sbc_bwt(b->filter, b->flen, &b->primary);
     }
-    b->bwt = sbc_bwt(b->lzp, b->lzplen, &b->primary);
     if (!b->bwt)
         return -1;
     b->bwtlen = b->lzplen;
-    if (sbc_enc_stage2_payload(&b->payload, b->bwt, (uint32_t)b->bwtlen) != 0)
+    if (sbc_enc_stage2_payload(&b->payload, b->bwt, (uint32_t)b->bwtlen,
+                              b->bwtlen) != 0)
         return -1;
     return 0;
 }
@@ -567,8 +733,8 @@ static int sbc_enc_text_ctrl(const uint8_t *data, size_t n)
 static int sbc_enc_policy_mode(int level, const uint8_t *data, size_t n,
                                size_t fulln, uint32_t *ctrl, uint32_t *m7)
 {
-    uint8_t *f = NULL;
-    size_t fl = 0;
+    uint8_t *f = NULL, *code = NULL;
+    size_t fl = 0, coden = 0;
     int mode, m6 = 0, m0 = 0;
 
     *ctrl = 0;
@@ -591,15 +757,22 @@ static int sbc_enc_policy_mode(int level, const uint8_t *data, size_t n,
      * (sbc_enc_text_ctrl).  SBC_M4CTRL forces one of the ctrl shapes
      * (0c/8c/ac/bc/fc), which is how the cost of each variant is measured. */
     if (n >= 600) {
-        const char *fm = getenv("SBC_M4CTRL");
-        uint32_t c = (fm && *fm) ? (uint32_t)strtoul(fm, NULL, 16)
-                                 : (uint32_t)sbc_enc_text_ctrl(data, fulln);
-        if (c && sbc_enc_mode4(data, n, c, &f, &fl, NULL, NULL) == 0) {
+        static const char *fm;
+        static int fm_ready;
+        uint32_t c;
+        if (!fm_ready) {
+            fm = getenv("SBC_M4CTRL");
+            fm_ready = 1;
+        }
+        c = (fm && *fm) ? (uint32_t)strtoul(fm, NULL, 16)
+                        : (uint32_t)sbc_enc_text_ctrl(data, fulln);
+        if (c && sbc_enc_mode4(data, n, c, &f, &fl, &code, &coden) == 0) {
             /* the filter reports the ctrl it actually wrote: the token bit of
              * the chooser's word is dropped when the token pass emitted no
              * code at all (`a b c ...` prose gets 0x0C, see sbc_enc_mode4) */
             *ctrl = sbc_enc_m4_ctrl_eff;
-            free(f);
+            sbc_m4_cache_take(data, n, sbc_enc_m4_ctrl_eff, f, fl, code,
+                              coden);
             return 4;
         }
     }
@@ -620,7 +793,10 @@ static int sbc_enc_policy_mode(int level, const uint8_t *data, size_t n,
         if (slack > 0x1000)
             slack = 0x1000;
         m6 = (fl + 6 <= n - slack);
-        free(f);
+        if (m6)
+            sbc_m6_cache_take(data, n, f, fl);
+        else
+            free(f);
     }
     if (getenv("SBC_POLDBG"))
         fprintf(stderr, "pol level=%d n=%zu m6=%d\n", level, n, m6);
@@ -628,8 +804,11 @@ static int sbc_enc_policy_mode(int level, const uint8_t *data, size_t n,
         if (sbc_enc_filter(data, n, 0, 0, 0, 0, &f, &fl, NULL, NULL,
                            NULL, 0) != 0)
             return -1;
-        free(f);
         m0 = (sbc_enc_m0_verdict != 0);
+        if (m0)
+            sbc_pol_cache_take(data, n, 0, f, fl);
+        else
+            free(f);
         if (getenv("SBC_M0DBG"))
             fprintf(stderr, "m0simp n=%zu coded=%d state=%d trial=%d v=%d\n",
                     n, sbc_enc_m0_coded, sbc_enc_m0_state, sbc_enc_m0_trial,
@@ -676,7 +855,10 @@ static int sbc_enc_policy_mode(int level, const uint8_t *data, size_t n,
                     sbc_m0a_last_t6c, sbc_m0a_last_t70, sbc_m0a_last_cnt_a,
                     sbc_m0a_last_cnt_b);
         mode = (sbc_enc_m0_verdict == 0) ? (m6 ? 6 : 5) : 0;
-        free(f);
+        if (mode == 0)
+            sbc_pol_cache_take(data, n, 1, f, fl);
+        else
+            free(f);
         return mode;
     }
     /* -m3: the analysis starts a block on mode 0 and the level-2 filter's own
@@ -735,9 +917,10 @@ static int sbc_enc_policy_mode(int level, const uint8_t *data, size_t n,
                 return 7;
             }
         }
-        free(f);
-        if (refused)
+        if (refused) {
+            free(f);
             return m6 ? 6 : 5;
+        }
         /* Applied: the record is mode 0, whatever the repeat filter would
          * have saved.  A record the filter accepted never becomes mode 6 --
          * ramp256 and image.raw at -m3 keep mode 0 although their mode-6
@@ -745,6 +928,7 @@ static int sbc_enc_policy_mode(int level, const uint8_t *data, size_t n,
          * compare the mode-0 payload against a copy's either (set2 -m3:
          * 24634 bytes against a copy payload that our pipeline puts 12 kB
          * lower). */
+        sbc_pol_cache_take(data, n, 2, f, fl);
         return 0;
     }
 }
@@ -820,6 +1004,9 @@ static int sbc_enc_block_dispatch(SbcBuf *out, const uint8_t *data, size_t n,
     uint32_t nrec = 0, cap = 0, i, off = 0, rc;
     int failed = 0;
 
+    sbc_pol_cache_clear();
+    sbc_m6_cache_clear();
+    sbc_m4_cache_clear();
     if (nsegs == 0 || n == 0 || (forced < 0 && !policy_on)) {
         rc = sbc_enc_stored_block(out, data, n, segs, nsegs, csum, extra,
                                   nsyms, flush_bytes, hash, level);
@@ -1007,9 +1194,13 @@ static int sbc_enc_block_dispatch(SbcBuf *out, const uint8_t *data, size_t n,
         free(owned[i]);
     free(owned);
     free(plan);
-    if (failed)
+    if (failed) {
+        sbc_pol_cache_clear();
+        sbc_m6_cache_clear();
+        sbc_m4_cache_clear();
         return sbc_enc_stored_block(out, data, n, segs, nsegs, csum, extra,
                                     nsyms, flush_bytes, hash, level);
+    }
     /* A copy-block payload has to win by more than SBC_ENC_MIN_GAIN bytes
      * (the coder's flush eats that much), but a *filtered* block is kept as
      * soon as its payload is smaller: the mode-6 cycle block stores 93 BWT
@@ -1040,7 +1231,34 @@ static int sbc_enc_block_dispatch(SbcBuf *out, const uint8_t *data, size_t n,
         rc = sbc_enc_comp_write(out, &b, data, n, csum, extra, nsyms,
                                 flush_bytes, hash, level, 1);
     } else {
+        int reuse = (b.flag3 == 0 && b.bwtlen == n && b.bwt);
+        if (reuse) {
+            for (i = 0; i < b.nsegs; i++)
+                if (b.modes[i] != 5) {
+                    reuse = 0;
+                    break;
+                }
+        }
+        if (reuse) {
+            uint8_t *L = b.bwt;
+            uint32_t prim = b.primary;
+            b.bwt = NULL;
+            sbc_enc_block_free(&b);
+            sbc_pol_cache_clear();
+            sbc_m6_cache_clear();
+            sbc_m4_cache_clear();
+            rc = sbc_enc_stored_block_ex(out, data, n, segs, nsegs, csum, extra,
+                                         nsyms, flush_bytes, hash, level, L,
+                                         prim);
+            free(L);
+            if (rc == 0 && level >= 1)
+                sbc_enc_feed_segs(data, segs, nsegs);
+            return rc;
+        }
         sbc_enc_block_free(&b);
+        sbc_pol_cache_clear();
+        sbc_m6_cache_clear();
+        sbc_m4_cache_clear();
         rc = sbc_enc_stored_block(out, data, n, segs, nsegs, csum, extra,
                                   nsyms, flush_bytes, hash, level);
         if (rc == 0 && level >= 1)
@@ -1058,6 +1276,9 @@ static int sbc_enc_block_dispatch(SbcBuf *out, const uint8_t *data, size_t n,
         }
     }
     sbc_enc_block_free(&b);
+    sbc_pol_cache_clear();
+    sbc_m6_cache_clear();
+    sbc_m4_cache_clear();
     return rc;
 }
 

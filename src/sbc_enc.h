@@ -34,8 +34,12 @@ static void sbc_buf_reserve(SbcBuf *b, size_t extra)
     }
 }
 
-static void sbc_buf_put(SbcBuf *b, uint8_t v)
+SBC_INLINE void sbc_buf_put(SbcBuf *b, uint8_t v)
 {
+    if (SBC_LIKELY(b->n < b->cap)) {
+        b->p[b->n++] = v;
+        return;
+    }
     sbc_buf_reserve(b, 1);
     if (b->err)
         return;
@@ -65,27 +69,26 @@ static void sbc_wrc_init(SbcWRC *w, SbcBuf *out)
     w->range = 0xFFFFFFFFu;
 }
 
-static FILE *sbc_wrclog_fp(void)
+static FILE *sbc_wrclog;
+static int sbc_wrclog_ready;
+
+static void sbc_wrclog_init(void)
 {
-    static FILE *f;
-    static int init;
-    if (!init) {
+    if (sbc_wrclog_ready)
+        return;
+    sbc_wrclog_ready = 1;
+    {
         const char *p = getenv("SBC_WRCLOG");
-        init = 1;
         if (p)
-            f = fopen(p, "w");
+            sbc_wrclog = fopen(p, "w");
     }
-    return f;
 }
 
 static void sbc_wrc_enc(SbcWRC *w, uint32_t start, uint32_t freq, uint32_t tot)
 {
-    {
-        FILE *lf = sbc_wrclog_fp();
-        if (lf)
-            fprintf(lf, "%u %u %u\n", tot, start, freq);
-    }
-    if (tot == 0 || freq == 0) {
+    if (SBC_UNLIKELY(sbc_wrclog))
+        fprintf(sbc_wrclog, "%u %u %u\n", tot, start, freq);
+    if (SBC_UNLIKELY(tot == 0 || freq == 0)) {
         w->out->err = 1;
         return;
     }
@@ -234,7 +237,10 @@ static void sbc_wex_sym(SbcWExtra *ex, uint32_t sym)
         sym = ex->nsyms - 1;
     while (ex->total > ex->cap_tot)
         sbc_wex_rescale(ex);
-    for (i = 0; i < sym; i++)
+    i = 0;
+    for (; i + 4 <= sym; i += 4)
+        acc += ex->freq[i] + ex->freq[i + 1] + ex->freq[i + 2] + ex->freq[i + 3];
+    for (; i < sym; i++)
         acc += ex->freq[i];
     sbc_wrc_enc(ex->wrc, acc, ex->freq[sym], ex->total);
     ex->freq[sym] += ex->inc;
@@ -331,36 +337,95 @@ typedef struct {
  * doubled buffer keeps comparing its true cyclic bytes instead of the zeros
  * after it.  Without this the 4-byte keys of the last few rotations pick up
  * the padding and an all-equal band splits where the vendor's does not. */
-static uint8_t sbc_bb(const SbcBwtBuf *k, uint32_t i)
+SBC_INLINE uint8_t sbc_bb(const SbcBwtBuf *k, uint32_t i)
 {
-    if (i >= k->end)
+    if (SBC_UNLIKELY(i >= k->end))
         i -= k->n;
-    return i < k->blen ? k->b[i] : 0;
+    return k->b[i];
+}
+
+SBC_INLINE uint32_t sbc_bb4(const SbcBwtBuf *k, uint32_t i)
+{
+    if (SBC_UNLIKELY(i >= k->end))
+        i -= k->n;
+#if defined(__GNUC__)
+    return __builtin_bswap32(sbc_ld32(k->b + i));
+#else
+    {
+        const uint8_t *p = k->b + i;
+        return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+               ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+    }
+#endif
 }
 
 /* byte key / 4-byte big-endian word key; returns -1, 0 or 1 */
-static int sbc_bwt_kcmp(const SbcBwtBuf *k, uint32_t x, uint32_t y,
-                        uint32_t d, int is4)
+SBC_INLINE int sbc_bwt_kcmp(const SbcBwtBuf *k, uint32_t x, uint32_t y,
+                            uint32_t d, int is4)
 {
-    int i, nb = is4 ? 4 : 1;
-    for (i = 0; i < nb; i++) {
-        uint8_t p = sbc_bb(k, x + d + (uint32_t)i);
-        uint8_t q = sbc_bb(k, y + d + (uint32_t)i);
+    if (is4) {
+        uint32_t p = sbc_bb4(k, x + d);
+        uint32_t q = sbc_bb4(k, y + d);
         if (p != q)
             return p < q ? -1 : 1;
+        return 0;
     }
-    return 0;
+    {
+        uint8_t p = sbc_bb(k, x + d);
+        uint8_t q = sbc_bb(k, y + d);
+        if (p != q)
+            return p < q ? -1 : 1;
+        return 0;
+    }
 }
 
 /* full byte compare over [d, limit) -- the insertion handler's comparator */
 static int sbc_bwt_cmp1(const SbcBwtBuf *k, uint32_t x, uint32_t y,
                         uint32_t d, uint32_t limit)
 {
-    uint32_t i;
-    for (i = d; i < limit; i++) {
-        uint8_t p = sbc_bb(k, x + i), q = sbc_bb(k, y + i);
+    uint32_t i = d;
+    uint32_t n = k->n;
+    uint32_t end = k->end;
+    const uint8_t *b = k->b;
+    uint32_t xi = x + i;
+    uint32_t yi = y + i;
+    if (SBC_UNLIKELY(xi >= end))
+        xi -= n;
+    if (SBC_UNLIKELY(yi >= end))
+        yi -= n;
+    while (i + 8 <= limit && xi + 8 <= end && yi + 8 <= end) {
+        uint64_t p, q;
+        memcpy(&p, b + xi, 8);
+        memcpy(&q, b + yi, 8);
+        if (p != q) {
+#if defined(__GNUC__)
+            unsigned t = (unsigned)__builtin_ctzll(p ^ q) >> 3;
+            uint8_t pb = b[xi + t], qb = b[yi + t];
+            return pb < qb ? -1 : 1;
+#else
+            uint32_t t;
+            for (t = 0; t < 8; t++) {
+                uint8_t pb = b[xi + t], qb = b[yi + t];
+                if (pb != qb)
+                    return pb < qb ? -1 : 1;
+            }
+#endif
+        }
+        i += 8;
+        xi += 8;
+        yi += 8;
+    }
+    while (i < limit) {
+        uint8_t p = b[xi], q = b[yi];
         if (p != q)
             return p < q ? -1 : 1;
+        i++;
+        xi++;
+        yi++;
+        if (SBC_UNLIKELY(xi >= end))
+            xi -= n;
+        if (SBC_UNLIKELY(yi >= end))
+            yi -= n;
     }
     return 0;
 }
@@ -449,7 +514,6 @@ static void sbc_bwt_part(uint32_t *a, uint32_t lo, uint32_t hi, uint32_t d,
     uint32_t p, spare = hi, eqL, eqR, i, j, carry, x, k1, k2;
     uint8_t v8 = 0;
     uint32_t v4 = 0;
-    int nb = is4 ? 4 : 1, t;
 
     if (size < 36) {
         p = sbc_bwt_med3(a, k, lo, lo + size / 2, hi - 1, d, is4);
@@ -463,13 +527,10 @@ static void sbc_bwt_part(uint32_t *a, uint32_t lo, uint32_t hi, uint32_t d,
             sbc_bwt_med3(a, k, hi - 1 - 2 * s, hi - 1 - s, hi - 1, d, is4),
             d, is4);
     }
-    for (t = 0; t < nb; t++) {
-        uint8_t c = sbc_bb(k, a[p] + d + (uint32_t)t);
-        if (is4)
-            v4 = (v4 << 8) | c;
-        else
-            v8 = c;
-    }
+    if (is4)
+        v4 = sbc_bb4(k, a[p] + d);
+    else
+        v8 = sbc_bb(k, a[p] + d);
     x = a[lo];
     a[lo] = a[p];
     a[p] = x;
@@ -488,41 +549,56 @@ static void sbc_bwt_part(uint32_t *a, uint32_t lo, uint32_t hi, uint32_t d,
         i++;
         if (i > j)
             break;
-        while (i <= j) {
-            uint32_t c = 0;
-            int q, eq;
-            for (q = 0; q < nb; q++) {
-                uint8_t b = sbc_bb(k, a[i] + d + (uint32_t)q);
-                c = (c << 8) | b;
+        if (is4) {
+            while (i <= j) {
+                uint32_t c = sbc_bb4(k, a[i] + d);
+                if (c > v4)
+                    break;
+                if (c == v4) {
+                    uint32_t tmp = a[eqL];
+                    a[eqL] = a[i];
+                    a[i] = tmp;
+                    eqL++;
+                }
+                i++;
             }
-            eq = is4 ? (c == v4) : ((c & 0xFF) == v8);
-            if (is4 ? (c > v4) : ((c & 0xFF) > v8))
-                break;
-            if (eq) {
-                uint32_t tmp = a[eqL];
-                a[eqL] = a[i];
-                a[i] = tmp;
-                eqL++;
+            while (i <= j) {
+                uint32_t c = sbc_bb4(k, a[j] + d);
+                if (c < v4)
+                    break;
+                if (c == v4) {
+                    uint32_t tmp = a[eqR];
+                    a[eqR] = a[j];
+                    a[j] = tmp;
+                    eqR--;
+                }
+                j--;
             }
-            i++;
-        }
-        while (i <= j) {
-            uint32_t c = 0;
-            int q, eq;
-            for (q = 0; q < nb; q++) {
-                uint8_t b = sbc_bb(k, a[j] + d + (uint32_t)q);
-                c = (c << 8) | b;
+        } else {
+            while (i <= j) {
+                uint8_t c = sbc_bb(k, a[i] + d);
+                if (c > v8)
+                    break;
+                if (c == v8) {
+                    uint32_t tmp = a[eqL];
+                    a[eqL] = a[i];
+                    a[i] = tmp;
+                    eqL++;
+                }
+                i++;
             }
-            eq = is4 ? (c == v4) : ((c & 0xFF) == v8);
-            if (is4 ? (c < v4) : ((c & 0xFF) < v8))
-                break;
-            if (eq) {
-                uint32_t tmp = a[eqR];
-                a[eqR] = a[j];
-                a[j] = tmp;
-                eqR--;
+            while (i <= j) {
+                uint8_t c = sbc_bb(k, a[j] + d);
+                if (c < v8)
+                    break;
+                if (c == v8) {
+                    uint32_t tmp = a[eqR];
+                    a[eqR] = a[j];
+                    a[j] = tmp;
+                    eqR--;
+                }
+                j--;
             }
-            j--;
         }
         if (j < i)
             break;
@@ -638,7 +714,11 @@ static uint8_t *sbc_bwt(const uint8_t *src, size_t n, uint32_t *primary)
     SbcBwtBuf k;
     uint32_t *a, cnt[256], sum, i, c;
     uint8_t *L, *buf;
-    size_t cp;
+    size_t cp, aneed, bneed;
+    static uint32_t *a_pool;
+    static size_t a_pool_n;
+    static uint8_t *buf_pool;
+    static size_t buf_pool_n;
 
     *primary = 0;
     L = (uint8_t *)malloc(n ? n : 1);
@@ -651,14 +731,29 @@ static uint8_t *sbc_bwt(const uint8_t *src, size_t n, uint32_t *primary)
         return L;
     }
     cp = n < 0x1000 ? n : 0x1000;
-    buf = (uint8_t *)calloc(n + cp + 64, 1);
-    a = (uint32_t *)malloc((n + 1) * sizeof(uint32_t));
-    if (!buf || !a) {
-        free(buf);
-        free(a);
-        free(L);
-        return NULL;
+    aneed = n + 1;
+    bneed = n + cp + 64;
+    if (a_pool_n < aneed) {
+        uint32_t *np = (uint32_t *)realloc(a_pool, aneed * sizeof(*a_pool));
+        if (!np) {
+            free(L);
+            return NULL;
+        }
+        a_pool = np;
+        a_pool_n = aneed;
     }
+    if (buf_pool_n < bneed) {
+        uint8_t *np = (uint8_t *)realloc(buf_pool, bneed);
+        if (!np) {
+            free(L);
+            return NULL;
+        }
+        buf_pool = np;
+        buf_pool_n = bneed;
+    }
+    a = a_pool;
+    buf = buf_pool;
+    memset(buf, 0, bneed);
     memcpy(buf, src, n);
     memcpy(buf + n, src, cp);
     k.b = buf;
@@ -667,35 +762,34 @@ static uint8_t *sbc_bwt(const uint8_t *src, size_t n, uint32_t *primary)
     k.end = (uint32_t)n + (cp > 7 ? (uint32_t)cp - 7 : (uint32_t)cp);
     k.per = sbc_bwt_period(src, (uint32_t)n);
 
-    memset(cnt, 0, sizeof(cnt));
-    for (i = 0; i < n; i++)
-        cnt[src[i]]++;
-    sum = 0;
-    for (c = 0; c < 256; c++) {
-        uint32_t t = cnt[c];
-        cnt[c] = sum;
-        sum += t;
+    {
+        uint32_t sz[256];
+        memset(sz, 0, sizeof(sz));
+        for (i = 0; i < n; i++)
+            sz[src[i]]++;
+        sum = 0;
+        for (c = 0; c < 256; c++) {
+            cnt[c] = sum;
+            sum += sz[c];
+        }
+        for (i = 0; i < n; i++)
+            a[cnt[src[i]]++] = i;
+        sum = 0;
+        for (c = 0; c < 256; c++) {
+            if (sz[c] && sz[c] != (uint32_t)n)
+                sbc_bwt_seg(a, sum, sum + sz[c], 1, &k, 0, (uint32_t)n);
+            sum += sz[c];
+        }
     }
-    for (i = 0; i < n; i++)
-        a[cnt[src[i]]++] = i;
-    /* cnt[] now holds the bucket ends; recount for the boundaries */
-    memset(cnt, 0, sizeof(cnt));
-    for (i = 0; i < n; i++)
-        cnt[src[i]]++;
-    sum = 0;
-    for (c = 0; c < 256; c++) {
-        uint32_t sz = cnt[c];
-        if (sz && sz != n)
-            sbc_bwt_seg(a, sum, sum + sz, 1, &k, 0, (uint32_t)n);
-        sum += sz;
+    {
+        uint32_t nn = (uint32_t)n;
+        for (i = 0; i < nn; i++) {
+            uint32_t pos = a[i];
+            if (pos == 0)
+                *primary = i;
+            L[i] = src[pos ? pos - 1 : nn - 1];
+        }
     }
-    for (i = 0; i < n; i++) {
-        if (a[i] == 0)
-            *primary = i;
-        L[i] = src[(a[i] + n - 1) % n];
-    }
-    free(a);
-    free(buf);
     return L;
 }
 
@@ -1138,21 +1232,26 @@ static uint32_t sbc_enc_lzp_mask_for_bs(uint32_t bs)
  * One payload block holding `n` bytes "stored": BWT only, no range-coded
  * payload (e1 == 0).  Mirrors sbc_block_read()/sbc_block_decode().
  */
-static int sbc_enc_stored_block(SbcBuf *out, const uint8_t *data, size_t n,
-                                const uint32_t *segs, uint32_t nsegs,
-                                uint32_t csum, SbcWExtra *extra,
-                                uint32_t nsyms, int flush_bytes,
-                                uint32_t *hash, uint32_t level)
+static int sbc_enc_stored_block_ex(SbcBuf *out, const uint8_t *data, size_t n,
+                                   const uint32_t *segs, uint32_t nsegs,
+                                   uint32_t csum, SbcWExtra *extra,
+                                   uint32_t nsyms, int flush_bytes,
+                                   uint32_t *hash, uint32_t level,
+                                   uint8_t *L_in, uint32_t primary_in)
 {
     SbcWRC w;
-    uint8_t *L;
-    uint32_t primary = 0, vlq = (uint32_t)n;
+    uint8_t *L = L_in;
+    uint32_t primary = primary_in, vlq = (uint32_t)n;
     SbcBitsW recs;
     size_t nb, k;
     SbcWDig idig, vdig;
     uint32_t dw = sbc_enc_dig_width(csum);
+    int own_L = 0;
 
-    L = sbc_bwt(data, n, &primary);
+    if (!L) {
+        L = sbc_bwt(data, n, &primary);
+        own_L = 1;
+    }
     if (!L)
         return -1;
 
@@ -1228,7 +1327,8 @@ static int sbc_enc_stored_block(SbcBuf *out, const uint8_t *data, size_t n,
             sbc_buf_put(out, dg[j]);
     }
     sbc_buf_write(out, L, n);
-    free(L);
+    if (own_L)
+        free(L);
     if (csum) {
         uint8_t dg[32];
         uint32_t j;
@@ -1239,6 +1339,16 @@ static int sbc_enc_stored_block(SbcBuf *out, const uint8_t *data, size_t n,
             sbc_buf_put(out, dg[j]);
     }
     return out->err ? -1 : 0;
+}
+
+static int sbc_enc_stored_block(SbcBuf *out, const uint8_t *data, size_t n,
+                                const uint32_t *segs, uint32_t nsegs,
+                                uint32_t csum, SbcWExtra *extra,
+                                uint32_t nsyms, int flush_bytes,
+                                uint32_t *hash, uint32_t level)
+{
+    return sbc_enc_stored_block_ex(out, data, n, segs, nsegs, csum, extra,
+                                   nsyms, flush_bytes, hash, level, NULL, 0);
 }
 
 static int sbc_enc_emit_block(SbcBuf *out, const uint8_t *data, size_t n,
@@ -1526,6 +1636,7 @@ static int sbc_enc_archive_ex(SbcBuf *out, const SbcEncFile *files,
     bs = sbc_enc_bsize(total, bsize_code);
     sbc_enc_blk_limit = (uint64_t)bs - 1u;
     sbc_enc_lzp_hmask = sbc_enc_lzp_mask_for_bs(bs);
+    sbc_wrclog_init();
     /* The header's "method" byte is the window bucket: window_size(method)
      * = (method << 19) + 0xFFFFF, i.e. the block size in 512 kB steps above
      * 1 MB.  It in turn fixes the shared model's symbol count. */

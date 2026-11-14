@@ -124,12 +124,16 @@ static void sbc_mw_rescale(SbcMW *m)
 
 static void sbc_mw_sym(SbcMW *m, uint32_t sym)
 {
-    uint32_t acc = 0, i;
+    uint32_t acc = 0, i, n;
     while (m->total > m->cap_tot)
         sbc_mw_rescale(m);
     if (sym >= m->active)
         sym = m->active - 1;
-    for (i = 0; i < sym; i++)
+    n = sym;
+    i = 0;
+    for (; i + 4 <= n; i += 4)
+        acc += m->freq[i] + m->freq[i + 1] + m->freq[i + 2] + m->freq[i + 3];
+    for (; i < n; i++)
         acc += m->freq[i];
     sbc_wrc_enc(m->wrc, acc, m->freq[sym], m->total);
     m->total += m->inc;
@@ -288,12 +292,10 @@ static uint32_t sbc_enc_stage1(SbcEncCtx *c, const uint8_t *S, uint32_t n,
 {
     uint32_t seen[256] = { 0 };
     uint32_t M = 0, i, cum = 0;
-    uint32_t *anch;
-    uint8_t *anch_sym;
+    uint32_t anch[256];
+    uint8_t anch_sym[256];
     if (n == 0)
         return 0;
-    anch = (uint32_t *)malloc(n * sizeof(uint32_t));
-    anch_sym = (uint8_t *)malloc(n);
     for (i = 0; i < n; i++) {
         uint8_t b = S[i];
         if (!seen[b]) {
@@ -341,11 +343,8 @@ static uint32_t sbc_enc_stage1(SbcEncCtx *c, const uint8_t *S, uint32_t n,
             cum = 1;
         } else {
             uint32_t remain = n - cum, kk, delta;
-            if (newpos < cum) {
-                free(anch);
-                free(anch_sym);
+            if (newpos < cum)
                 return 0;
-            }
             delta = newpos - cum;
             if (remain <= 1) {
                 sbc_mw_resize(&c->E, remain);
@@ -378,8 +377,6 @@ static uint32_t sbc_enc_stage1(SbcEncCtx *c, const uint8_t *S, uint32_t n,
         pos[i] = newpos;
     }
     pos[M] = n;
-    free(anch);
-    free(anch_sym);
     return M;
 }
 
@@ -397,15 +394,21 @@ static uint32_t sbc_enc_model_index(uint32_t state)
 /* Builds the payload for a stage2 input S of n bytes into `out`: range-coded
  * stream from the front, raw bits packed MSB-first then reversed at the back.
  * Returns 0 on success. */
-static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n)
+static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n,
+                                  size_t maxn)
 {
     SbcWRC wrc;
     SbcEncCtx ctx;
     uint32_t *pos = NULL;
+    uint32_t *occ = NULL;
     uint32_t M;
     int rc = -1, i;
+    static const char *t2dbg;
+    static int t2dbg_ready;
     if (n == 0)
         return 0;
+    if (maxn)
+        sbc_buf_reserve(out, maxn);
     sbc_wrc_init(&wrc, out);
     if (sbc_enc_ctx_init(&ctx, n, &wrc) != 0)
         return -1;
@@ -420,6 +423,23 @@ static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n)
     {
         uint32_t outn = 0, threshold = 0x2000000u;
         long it = 0, itcap = 200000L + 8L * (long)n;
+        uint32_t occ_cnt[256];
+        uint32_t occ_off[257];
+        uint32_t occ_cur[256];
+        uint32_t oi, b;
+        occ = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+        if (!occ)
+            goto done;
+        memset(occ_cnt, 0, sizeof(occ_cnt));
+        for (oi = 0; oi < n; oi++)
+            occ_cnt[S[oi]]++;
+        occ_off[0] = 0;
+        for (b = 0; b < 256; b++)
+            occ_off[b + 1] = occ_off[b] + occ_cnt[b];
+        memcpy(occ_cnt, occ_off, sizeof(occ_cnt));
+        memcpy(occ_cur, occ_off, sizeof(occ_cur));
+        for (oi = 0; oi < n; oi++)
+            occ[occ_cnt[S[oi]]++] = oi;
         for (;;) {
             uint32_t d1, prev, prevsym, state, aidx, t, esi;
             int64_t gap, nd;
@@ -427,6 +447,10 @@ static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n)
             int have_T = 0;
             if (++it > itcap)
                 goto done;
+            if (maxn && out->n >= maxn) {
+                rc = 1;
+                goto done;
+            }
             d1 = pos[1];
             nd = (int64_t)n - (int64_t)d1;
             if (!((int64_t)threshold < nd)) {
@@ -439,12 +463,6 @@ static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n)
             gap = (int64_t)pos[1] - (int64_t)pos[0];
             if (gap > (int64_t)(n - outn))
                 gap = (int64_t)(n - outn);
-            {
-                int64_t j;
-                for (j = 0; j < gap; j++)
-                    if (S[outn + (uint32_t)j] != (uint8_t)prev)
-                        goto done; /* inconsistent input */
-            }
             outn += (uint32_t)gap;
             if (outn >= n) {
                 if (M <= 1) {
@@ -460,16 +478,17 @@ static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n)
             prevsym = S[outn - 1];
             state = ctx.map[prevsym];
             aidx = sbc_enc_model_index(state);
-            /* next occurrence of prev strictly after pos[1] */
+            /* next occurrence of prev strictly after pos[1]; d1 is
+             * non-decreasing so each symbol's cursor only walks forward */
             {
-                size_t off = (size_t)pos[1] + 1;
-                const uint8_t *hit = NULL;
-                if (off < n)
-                    hit = (const uint8_t *)memchr(S + off, (uint8_t)prev,
-                                                  n - off);
-                if (hit) {
+                uint32_t lo = occ_cur[prev];
+                uint32_t hi = occ_off[prev + 1];
+                while (lo < hi && occ[lo] <= d1)
+                    lo++;
+                occ_cur[prev] = lo;
+                if (lo < hi) {
                     have_T = 1;
-                    T = (uint32_t)(hit - S);
+                    T = occ[lo];
                 }
             }
             if (!have_T) {
@@ -557,6 +576,7 @@ static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n)
         }
     }
 done:
+    free(occ);
     free(pos);
     if (rc == 0) {
         size_t i2, nb;
@@ -564,13 +584,17 @@ done:
         if (ctx.accn)
             sbc_enc_push_byte(&ctx, (uint8_t)(ctx.acc << (8 - ctx.accn)));
         nb = ctx.nbits;
-        if (getenv("SBC_T2DBG"))
+        if (!t2dbg_ready) {
+            t2dbg = getenv("SBC_T2DBG");
+            t2dbg_ready = 1;
+        }
+        if (t2dbg)
             fprintf(stderr, "rc=%zu bits=%zu\n", out->n, nb);
         for (i2 = 0; i2 < nb; i2++)
             sbc_buf_put(out, ctx.bits[nb - 1 - i2]);
     }
     sbc_enc_ctx_free(&ctx);
-    return rc;
+    return rc == 1 ? 0 : rc;
 }
 
 #endif /* SBC_ENC_STAGE2_H */

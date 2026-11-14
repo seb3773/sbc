@@ -208,10 +208,7 @@ static int sbc_enc_adv_lag(const uint8_t *src, int P, int nmod, int f40, int n)
 static int sbc_enc_mode0_adaptive(const uint8_t *d, size_t n,
                                   const SbcM0Params *pp, uint8_t *r)
 {
-    uint8_t *f = sbc_m0_adaptive(d, n, pp, 1);
-    /* diagnostics: the first-chunk lag of the advanced variant */
-    sbc_enc_m0_lag = sbc_enc_adv_lag(d, pp->pool < 24 ? 24 : pp->pool,
-                                     pp->nmod, pp->first, (int)n);
+    uint8_t *f = sbc_m0_adaptive(d, n, pp, 1, r);
     sbc_enc_m0_verdict = sbc_m0a_last_verdict;
     if (!f) {
         sbc_enc_m0_ok = 0;
@@ -219,8 +216,6 @@ static int sbc_enc_mode0_adaptive(const uint8_t *d, size_t n,
         return 0;
     }
     sbc_enc_m0_ok = sbc_m0a_scr_ok;
-    memcpy(r, f, n);
-    free(f);
     return 0;
 }
 
@@ -1779,20 +1774,34 @@ static int sbc_enc_mode6_abs(const uint8_t *d, size_t n, size_t p0,
     out = (uint8_t *)malloc(cap);
     if (!out)
         return -1;
+    {
+        size_t slack = n >> 7;
+        if (slack > 0x1000)
+            slack = 0x1000;
+        cap = (n > slack) ? n - slack : 0;
+    }
     out[o++] = d[p0];
     out[o++] = d[p0 + 1];
     while (p < end) {
+        if (o + 6 > cap) {
+            free(out);
+            return -1;
+        }
         uint32_t ctx = (uint32_t)d[p - 2] | ((uint32_t)d[p - 1] << 8);
         size_t sp = table[ctx], len = 0;
 
-        if (sp && p + 9 <= end && memcmp(d + sp, d + p, 4) == 0 &&
-            memcmp(d + sp + 4, d + p + 4, 4) == 0 && d[sp + 8] == d[p + 8]) {
+        if (sp && p + 9 <= end && sbc_ld32(d + sp) == sbc_ld32(d + p) &&
+            sbc_ld32(d + sp + 4) == sbc_ld32(d + p + 4) &&
+            d[sp + 8] == d[p + 8]) {
             size_t rem = end - p;
             size_t max = (p - sp < rem ? p - sp : rem) - 1;
             if (max > 0x40000E)
                 max = 0x40000E;
             if (max >= 17) {
                 len = 8;
+                while (len + 8 <= max &&
+                       sbc_ld64(d + sp + len) == sbc_ld64(d + p + len))
+                    len += 8;
                 while (len < max && d[sp + len] == d[p + len])
                     len++;
             }
@@ -1803,14 +1812,18 @@ static int sbc_enc_mode6_abs(const uint8_t *d, size_t n, size_t p0,
                 uint32_t ctx2 = (uint32_t)d[p - 1] | ((uint32_t)d[p] << 8);
                 size_t sp2 = table[ctx2];
                 if (sp2 && sp2 != sp &&
-                    memcmp(d + sp2, d + p + 1, 4) == 0 &&
-                    memcmp(d + sp2 + 4, d + p + 5, 4) == 0 &&
+                    sbc_ld32(d + sp2) == sbc_ld32(d + p + 1) &&
+                    sbc_ld32(d + sp2 + 4) == sbc_ld32(d + p + 5) &&
                     d[sp2 + 8] == d[p + 9]) {
                     size_t rem2 = end - (p + 1);
                     size_t max2 = (p + 1 - sp2 < rem2 ? p + 1 - sp2 : rem2) - 1;
                     size_t len2 = 8;
                     if (max2 > 0x40000E)
                         max2 = 0x40000E;
+                    while (len2 + 8 <= max2 &&
+                           sbc_ld64(d + sp2 + len2) ==
+                               sbc_ld64(d + p + 1 + len2))
+                        len2 += 8;
                     while (len2 < max2 && d[sp2 + len2] == d[p + 1 + len2])
                         len2++;
                     if (len2 >= 17 && len + 1 < len2)
@@ -1862,11 +1875,17 @@ static int sbc_enc_mode6(const uint8_t *d, size_t n, uint8_t **outp,
 
     if (n < 2)
         return -1;
-    table = (uint32_t *)calloc(1u << 16, sizeof(*table));
-    if (!table)
-        return -1;
+    static uint32_t *table_pool;
+    table = table_pool;
+    if (!table) {
+        table = (uint32_t *)calloc(1u << 16, sizeof(*table));
+        if (!table)
+            return -1;
+        table_pool = table;
+    } else {
+        memset(table, 0, (1u << 16) * sizeof(*table));
+    }
     rc = sbc_enc_mode6_abs(d, n, 0, table, outp, outn);
-    free(table);
     return rc;
 }
 

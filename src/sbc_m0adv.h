@@ -208,7 +208,8 @@ static long sbc_m0a_last_fam_a, sbc_m0a_last_fam_b;
 static long sbc_m0a_last_slot[12];
 
 static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
-                                      const SbcM0Params *pp, int enc)
+                                      const SbcM0Params *pp, int enc,
+                                      unsigned char *dst_in)
 {
     static const int lags0[11] = { 0, 2, 3, 4, 8, 10, 16, 20, 12, 6, 24 };
     int lag[11], ctx[11], score[11], shadow[11];
@@ -217,6 +218,11 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
     unsigned char *tab[11];
     unsigned char *dst;
     unsigned char *scrA = NULL, *scrB = NULL;
+    static unsigned char *tab_pool[11];
+    static unsigned char *scrA_pool, *scrB_pool;
+    static int pool_ready;
+    static const char *m0trace;
+    static int m0trace_ready;
     long cntA = 0, cntB = 0, famA = 0, famB = 0;
     long slot[12];
     const unsigned char *pred;
@@ -234,7 +240,7 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
 
     if (n < (size_t)pp->minlen + SBC_M0A_REFUSE_EXTRA || pp->nmod > 10)
         return NULL;
-    dst = (unsigned char *)malloc(n ? n : 1);
+    dst = dst_in ? dst_in : (unsigned char *)malloc(n ? n : 1);
     if (!dst)
         return NULL;
     P = pp->pool < 24 ? 24 : pp->pool;
@@ -248,26 +254,39 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
     }
     memcpy(dst, src, n);
     memset(w, 0, sizeof(w));
-    for (i = 0; i < 11; i++) {
-        tab[i] = (unsigned char *)calloc(65536, 1);
-        if (!tab[i]) {
-            for (k = 0; k < i; k++)
-                free(tab[k]);
-            free(dst);
+    if (!pool_ready) {
+        for (i = 0; i < 11; i++) {
+            tab_pool[i] = (unsigned char *)calloc(65536, 1);
+            if (!tab_pool[i]) {
+                for (k = 0; k < i; k++)
+                    free(tab_pool[k]);
+                if (!dst_in)
+                    free(dst);
+                return NULL;
+            }
+        }
+        scrA_pool = (unsigned char *)calloc(65536, 1);
+        scrB_pool = (unsigned char *)calloc(65536, 1);
+        if (!scrA_pool || !scrB_pool) {
+            free(scrA_pool);
+            free(scrB_pool);
+            for (k = 0; k < 11; k++)
+                free(tab_pool[k]);
+            if (!dst_in)
+                free(dst);
             return NULL;
         }
+        pool_ready = 1;
+    }
+    for (i = 0; i < 11; i++) {
+        tab[i] = tab_pool[i];
+        memset(tab[i], 0, 65536);
     }
     if (pp->pool) {
-        scrA = (unsigned char *)calloc(65536, 1);
-        scrB = (unsigned char *)calloc(65536, 1);
-        if (!scrA || !scrB) {
-            free(scrA);
-            free(scrB);
-            for (k = 0; k < 11; k++)
-                free(tab[k]);
-            free(dst);
-            return NULL;
-        }
+        scrA = scrA_pool;
+        scrB = scrB_pool;
+        memset(scrA, 0, 65536);
+        memset(scrB, 0, 65536);
     }
     memset(score, 0, sizeof(score));
     memset(shadow, 0, sizeof(shadow));
@@ -279,7 +298,11 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
     tabn = nmod + 1;
     limit = pp->first;
     remaining = n - (size_t)P;
-    if (getenv("SBC_M0TRACE"))
+    if (!m0trace_ready) {
+        m0trace = getenv("SBC_M0TRACE");
+        m0trace_ready = 1;
+    }
+    if (m0trace)
         fprintf(stderr, "M0 start n=%zu P=%d first=%d minlen=%d ext=%d nmod=%d "
                         "pool=%d enc=%d\n",
                 n, P, pp->first, pp->minlen, pp->ext, nmod, pool, enc);
@@ -288,7 +311,7 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
         int counter = 0;
         if (limit < 1)
             break;
-        if (getenv("SBC_M0TRACE"))
+        if (m0trace)
             fprintf(stderr, "M0 chunk base=%zu limit=%d active=%d rem=%zu\n",
                     base, limit, active, remaining);
         while ((long)chunkpos < (long)limit) {
@@ -456,7 +479,7 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
             if (cut)
                 break;
         }
-        if (getenv("SBC_M0TRACE"))
+        if (m0trace)
             fprintf(stderr, "M0 endchunk pos=%zu cut=%d active=%d limit=%d "
                             "sc0=%d scA=%d t6c=%ld t70=%ld\n",
                     chunkpos, cut, active, limit, score[0],
@@ -522,8 +545,6 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
         }
         base += chunkpos;
     }
-    for (i = 0; i < 11; i++)
-        free(tab[i]);
     if (scrA) {
         /* The vendor's own test refuses a tie: the predictor has to leave
          * *fewer* new two-byte contexts in the residual than the input has
@@ -540,8 +561,6 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
         sbc_m0a_last_fam_a = famA;
         sbc_m0a_last_fam_b = famB;
         memcpy(sbc_m0a_last_slot, slot, sizeof(sbc_m0a_last_slot));
-        free(scrA);
-        free(scrB);
     } else {
         sbc_m0a_last_cnt_a = 0;
         sbc_m0a_last_cnt_b = 0;

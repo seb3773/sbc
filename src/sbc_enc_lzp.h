@@ -65,10 +65,10 @@ static void sbc_lzp_params_default(SbcLzpParams *p)
     p->hmask = SBC_LZP_HASH_MASK;
 }
 
-static uint32_t sbc_lzp_h4(const uint8_t *src, size_t pos, uint32_t mask)
+SBC_INLINE uint32_t sbc_lzp_h4(const uint8_t *src, size_t pos, uint32_t mask)
 {
-    uint32_t w = (uint32_t)src[pos - 4] | ((uint32_t)src[pos - 3] << 8) |
-                 ((uint32_t)src[pos - 2] << 16) | ((uint32_t)src[pos - 1] << 24);
+    uint32_t w;
+    memcpy(&w, src + pos - 4, 4);
     return ((w >> 19) ^ w) & mask;
 }
 
@@ -76,8 +76,10 @@ static uint32_t sbc_lzp_h4(const uint8_t *src, size_t pos, uint32_t mask)
 static int sbc_lzp_encode(const uint8_t *src, size_t n, uint8_t *dst,
                           size_t cap, size_t *outn, const SbcLzpParams *pp)
 {
+    static int32_t *tab_pool;
+    static size_t tab_pool_n;
     int32_t *tab;
-    size_t ip, op, ebp = 0, limit_op;
+    size_t ip, op, ebp = 0, limit_op, tneed;
     const size_t W = pp->window;
     const uint32_t MINLEN = pp->minlen;
     const uint32_t HM = pp->hmask;
@@ -88,10 +90,16 @@ static int sbc_lzp_encode(const uint8_t *src, size_t n, uint8_t *dst,
         *outn = n;
         return 0;
     }
-    tab = (int32_t *)malloc(((size_t)HM + 1) * sizeof(*tab));
-    if (!tab)
-        return -1;
-    memset(tab, 0xFF, ((size_t)HM + 1) * sizeof(*tab));
+    tneed = (size_t)HM + 1;
+    if (tab_pool_n < tneed) {
+        int32_t *np = (int32_t *)realloc(tab_pool, tneed * sizeof(*tab_pool));
+        if (!np)
+            return -1;
+        tab_pool = np;
+        tab_pool_n = tneed;
+    }
+    tab = tab_pool;
+    memset(tab, 0xFF, tneed * sizeof(*tab));
 
     ip = op = n < (size_t)W + 4 ? n : (size_t)W + 4;
     memcpy(dst, src, ip);
@@ -101,7 +109,6 @@ static int sbc_lzp_encode(const uint8_t *src, size_t n, uint8_t *dst,
     while (ip < n) {
         size_t sp = 0, len = 0;
         if (op >= limit_op) {
-            free(tab);
             *outn = 0;
             return 1; /* no gain: vendor bails out with 0 */
         }
@@ -121,8 +128,13 @@ static int sbc_lzp_encode(const uint8_t *src, size_t n, uint8_t *dst,
                 if (limit > (size_t)pp->maxlen - 1)
                     limit = (size_t)pp->maxlen - 1;
                 k = 0;
+                while (k + 1 <= limit &&
+                       sbc_ld64(src + sp + 4 * k) ==
+                           sbc_ld64(src + ip + 4 * k))
+                    k += 2;
                 while (k <= limit &&
-                       memcmp(src + sp + 4 * k, src + ip + 4 * k, 4) == 0)
+                       sbc_ld32(src + sp + 4 * k) ==
+                           sbc_ld32(src + ip + 4 * k))
                     k++;
                 len = k > limit ? limit : k;
             }
@@ -164,7 +176,6 @@ static int sbc_lzp_encode(const uint8_t *src, size_t n, uint8_t *dst,
             ip++;
         }
     }
-    free(tab);
     *outn = op;
     return 0;
 }

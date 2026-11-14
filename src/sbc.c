@@ -7,6 +7,15 @@
 #include <string.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#if defined(__GNUC__)
+#define SBC_LIKELY(x) __builtin_expect(!!(x), 1)
+#define SBC_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define SBC_INLINE static inline __attribute__((always_inline))
+#else
+#define SBC_LIKELY(x) (x)
+#define SBC_UNLIKELY(x) (x)
+#define SBC_INLINE static inline
+#endif
 #ifdef _WIN32
 #include <direct.h>
 #define sbc_mkdir(p) _mkdir(p)
@@ -36,15 +45,34 @@ static uint8_t sbc_rdr_get(SbcReader *r)
 
 static int sbc_bitlen(uint32_t n)
 {
-    int k;
     if (n == 0)
         return 1;
-    k = 0;
-    while (n) {
-        k++;
-        n >>= 1;
+#if defined(__GNUC__)
+    return 32 - __builtin_clz(n);
+#else
+    {
+        int k = 0;
+        while (n) {
+            k++;
+            n >>= 1;
+        }
+        return k;
     }
-    return k;
+#endif
+}
+
+SBC_INLINE uint32_t sbc_ld32(const uint8_t *p)
+{
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+SBC_INLINE uint64_t sbc_ld64(const uint8_t *p)
+{
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return v;
 }
 
 static void sbc_rc_shift(SbcRC *rc)
@@ -2099,9 +2127,9 @@ typedef struct {
 static uint8_t *sbc_mode0_inv(const uint8_t *src, size_t n, int level)
 {
     if (level >= 2)
-        return sbc_m0_adaptive(src, n, &sbc_m0_params_l2, 0);
+        return sbc_m0_adaptive(src, n, &sbc_m0_params_l2, 0, NULL);
     if (level == 1)
-        return sbc_m0_adaptive(src, n, &sbc_m0_params_l1, 0);
+        return sbc_m0_adaptive(src, n, &sbc_m0_params_l1, 0, NULL);
     return sbc_apply_mode0(src, n);
 }
 
@@ -3965,7 +3993,7 @@ static int sbc_stage2_selftest(const char *spath, const char *ppath)
         return 2;
     }
     memset(&out, 0, sizeof(out));
-    r = sbc_enc_stage2_payload(&out, S, (uint32_t)sn);
+    r = sbc_enc_stage2_payload(&out, S, (uint32_t)sn, 0);
     n = out.n < pn ? out.n : pn;
     for (i = 0; i < n; i++) {
         if (out.p[i] != P[i]) {
@@ -4569,8 +4597,8 @@ int main(int argc, char **argv)
         if (!D)
             return 2;
         for (k = 0; k < 2; k++) {
-            uint8_t *res = sbc_m0_adaptive(D, dn, ps[k], 1);
-            uint8_t *back = res ? sbc_m0_adaptive(res, dn, ps[k], 0) : NULL;
+            uint8_t *res = sbc_m0_adaptive(D, dn, ps[k], 1, NULL);
+            uint8_t *back = res ? sbc_m0_adaptive(res, dn, ps[k], 0, NULL) : NULL;
             if (!res || !back) {
                 printf("inst%d: REFUSED (n=%zu)\n", k, dn);
                 free(res);

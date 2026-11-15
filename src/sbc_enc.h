@@ -915,14 +915,7 @@ static uint32_t sbc_dos_datetime(time_t t)
  */
 static uint32_t sbc_enc_crc16_upd(uint32_t c, const uint8_t *d, size_t n)
 {
-    size_t i;
-    for (i = 0; i < n; i++) {
-        int k;
-        c ^= d[i];
-        for (k = 0; k < 8; k++)
-            c = (c & 1) ? ((c >> 1) ^ 0xA001) : (c >> 1);
-    }
-    return c;
+    return sbc_crc_refl(c, d, n, sbc_crct16);
 }
 
 /*
@@ -968,24 +961,11 @@ static void sbc_enc_dig_upd(SbcWDig *d, const uint8_t *p, size_t n)
         return;
     }
     if (d->type == 2) {
-        for (i = 0; i < n; i++) {
-            int k;
-            d->crc ^= p[i];
-            for (k = 0; k < 8; k++)
-                d->crc = (d->crc & 1) ? ((d->crc >> 1) ^ 0xEDB88320u)
-                                      : (d->crc >> 1);
-        }
+        d->crc = sbc_crc_refl(d->crc, p, n, sbc_crct32);
         return;
     }
     if (d->type == 3) {
-        for (i = 0; i < n; i++) {
-            d->a += p[i];
-            if (d->a >= 65521u)
-                d->a -= 65521u;
-            d->b += d->a;
-            if (d->b >= 65521u)
-                d->b -= 65521u;
-        }
+        sbc_adler_upd(&d->a, &d->b, p, n);
         return;
     }
     if (d->type >= 5) {

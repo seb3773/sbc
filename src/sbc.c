@@ -2840,32 +2840,89 @@ static int sbc_block_decode_inner(const uint8_t *data, size_t len,
     return 0;
 }
 
+/* ---- table-driven reflected CRCs (slice-by-8) ----
+ * Same polynomials and bit order as the bitwise loops they replace (CRC16/ARC
+ * 0xA001 and CRC32/IEEE 0xEDB88320, both reflected); slicing only regroups the
+ * per-bit steps eight bytes at a time, so every value is identical. */
+static uint32_t sbc_crct16[8][256], sbc_crct32[8][256];
+static int sbc_crct_ready;
+
+static void sbc_crct_init(void)
+{
+    uint32_t i, k, t;
+    if (sbc_crct_ready)
+        return;
+    for (i = 0; i < 256; i++) {
+        uint32_t a = i, b = i;
+        for (k = 0; k < 8; k++) {
+            a = (a & 1) ? ((a >> 1) ^ 0xA001u) : (a >> 1);
+            b = (b & 1) ? ((b >> 1) ^ 0xEDB88320u) : (b >> 1);
+        }
+        sbc_crct16[0][i] = a;
+        sbc_crct32[0][i] = b;
+    }
+    for (t = 1; t < 8; t++)
+        for (i = 0; i < 256; i++) {
+            uint32_t a = sbc_crct16[t - 1][i], b = sbc_crct32[t - 1][i];
+            sbc_crct16[t][i] = (a >> 8) ^ sbc_crct16[0][a & 0xFF];
+            sbc_crct32[t][i] = (b >> 8) ^ sbc_crct32[0][b & 0xFF];
+        }
+    sbc_crct_ready = 1;
+}
+
+/* c: running register (CRC16 uses its low 16 bits) */
+static uint32_t sbc_crc_refl(uint32_t c, const uint8_t *d, size_t n,
+                             uint32_t (*tab)[256])
+{
+    sbc_crct_init();
+    while (n >= 8) {
+        uint32_t lo = c ^ ((uint32_t)d[0] | ((uint32_t)d[1] << 8) |
+                           ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24));
+        uint32_t hi = (uint32_t)d[4] | ((uint32_t)d[5] << 8) |
+                      ((uint32_t)d[6] << 16) | ((uint32_t)d[7] << 24);
+        c = tab[7][lo & 0xFF] ^ tab[6][(lo >> 8) & 0xFF] ^
+            tab[5][(lo >> 16) & 0xFF] ^ tab[4][lo >> 24] ^
+            tab[3][hi & 0xFF] ^ tab[2][(hi >> 8) & 0xFF] ^
+            tab[1][(hi >> 16) & 0xFF] ^ tab[0][hi >> 24];
+        d += 8;
+        n -= 8;
+    }
+    while (n--)
+        c = (c >> 8) ^ tab[0][(c ^ *d++) & 0xFF];
+    return c;
+}
+
+/* running Adler32; deferring the modulo over 5552-byte runs (zlib's NMAX,
+ * the longest run that cannot overflow 32 bits) gives the same values as
+ * reducing after every byte */
+static void sbc_adler_upd(uint32_t *pa, uint32_t *pb, const uint8_t *d,
+                          size_t n)
+{
+    uint32_t a = *pa, b = *pb;
+    while (n) {
+        size_t k = n < 5552 ? n : 5552;
+        n -= k;
+        while (k--) {
+            a += *d++;
+            b += a;
+        }
+        a %= 65521u;
+        b %= 65521u;
+    }
+    *pa = a;
+    *pb = b;
+}
+
 /* ---- CRC32 (IEEE) and Adler32, the 32-bit -h digests ---- */
 static uint32_t sbc_crc32_ieee(const uint8_t *d, size_t n)
 {
-    uint32_t c = 0xFFFFFFFFu;
-    size_t i;
-    for (i = 0; i < n; i++) {
-        int k;
-        c ^= d[i];
-        for (k = 0; k < 8; k++)
-            c = (c & 1) ? ((c >> 1) ^ 0xEDB88320u) : (c >> 1);
-    }
-    return c ^ 0xFFFFFFFFu;
+    return sbc_crc_refl(0xFFFFFFFFu, d, n, sbc_crct32) ^ 0xFFFFFFFFu;
 }
 
 static uint32_t sbc_adler32(const uint8_t *d, size_t n)
 {
     uint32_t a = 1, b = 0;
-    size_t i;
-    for (i = 0; i < n; i++) {
-        a += d[i];
-        if (a >= 65521u)
-            a -= 65521u;
-        b += a;
-        if (b >= 65521u)
-            b -= 65521u;
-    }
+    sbc_adler_upd(&a, &b, d, n);
     return (b << 16) | a;
 }
 
@@ -2907,15 +2964,7 @@ static uint32_t sbc_sum32(const uint8_t *d, size_t n)
 /* ---- CRC16/ARC (poly 0xA001, init 0xFFFF, xorout 0xFFFF) ---- */
 static uint16_t sbc_crc16_arc(const uint8_t *d, size_t n)
 {
-    uint16_t c = 0xFFFF;
-    size_t i;
-    for (i = 0; i < n; i++) {
-        int k;
-        c ^= d[i];
-        for (k = 0; k < 8; k++)
-            c = (uint16_t)((c & 1) ? ((c >> 1) ^ 0xA001) : (c >> 1));
-    }
-    return (uint16_t)(c ^ 0xFFFF);
+    return (uint16_t)(sbc_crc_refl(0xFFFF, d, n, sbc_crct16) ^ 0xFFFF);
 }
 
 /*

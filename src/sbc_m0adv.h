@@ -207,6 +207,55 @@ static long sbc_m0a_last_fam_a, sbc_m0a_last_fam_b;
  * shrink nmod, but the array keeps its indices). */
 static long sbc_m0a_last_slot[12];
 
+
+/* Pool-lag weights: w[k] += |orig - pred[p - k]| for k = 5..pool-1, once per
+ * analysed byte -- 48 absolute differences per byte at -m3, the hottest part
+ * of the filter.  With SSE2 (baseline on x86-64) and pool == 53 the 48 lags
+ * are three 16-byte loads of pred[p-52 .. p-5]; the differences go to 16-bit
+ * lane accumulators folded into w[] every 256 bytes (255 * 256 < 65536, so no
+ * lane can wrap) and before every read of w[] (sbc_m0a_pool at chunk end).
+ * Pure integer sums: the result is identical to the scalar loop. */
+#if defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>
+#define SBC_M0A_SIMD 1
+typedef struct {
+    __m128i a[6];
+    int cnt;
+} SbcM0Acc;
+
+static void sbc_m0a_acc_flush(SbcM0Acc *acc, int *w)
+{
+    uint16_t t[48];
+    int j;
+    if (!acc->cnt)
+        return;
+    for (j = 0; j < 6; j++) {
+        _mm_storeu_si128((__m128i *)(t + 8 * j), acc->a[j]);
+        acc->a[j] = _mm_setzero_si128();
+    }
+    for (j = 0; j < 48; j++)
+        w[52 - j] += t[j];
+    acc->cnt = 0;
+}
+
+SBC_INLINE void sbc_m0a_acc_add(SbcM0Acc *acc, int *w, unsigned orig,
+                                const unsigned char *q /* pred + p - 52 */)
+{
+    const __m128i z = _mm_setzero_si128();
+    const __m128i o = _mm_set1_epi8((char)orig);
+    int g;
+    for (g = 0; g < 3; g++) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(q + 16 * g));
+        __m128i d = _mm_or_si128(_mm_subs_epu8(v, o), _mm_subs_epu8(o, v));
+        acc->a[2 * g] = _mm_add_epi16(acc->a[2 * g], _mm_unpacklo_epi8(d, z));
+        acc->a[2 * g + 1] =
+            _mm_add_epi16(acc->a[2 * g + 1], _mm_unpackhi_epi8(d, z));
+    }
+    if (++acc->cnt == 256)
+        sbc_m0a_acc_flush(acc, w);
+}
+#endif
+
 static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
                                       const SbcM0Params *pp, int enc,
                                       unsigned char *dst_in)
@@ -215,6 +264,9 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
     int lag[11], ctx[11], score[11], shadow[11];
     long t54 = 0, t6c = 0, t70 = 0;
     int w[64];
+#ifdef SBC_M0A_SIMD
+    SbcM0Acc acc;
+#endif
     unsigned char *tab[11];
     unsigned char *dst;
     unsigned char *scrA = NULL, *scrB = NULL;
@@ -254,6 +306,9 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
     }
     memcpy(dst, src, n);
     memset(w, 0, sizeof(w));
+#ifdef SBC_M0A_SIMD
+    memset(&acc, 0, sizeof(acc));
+#endif
     if (!pool_ready) {
         for (i = 0; i < 11; i++) {
             tab_pool[i] = (unsigned char *)calloc(65536, 1);
@@ -343,11 +398,18 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
                     }
                     ctx[i] = (int)d << 8;
                 }
-                if (pool)
+                if (pool) {
+#ifdef SBC_M0A_SIMD
+                    if (pool == 53)
+                        sbc_m0a_acc_add(&acc, w, orig,
+                                        pred + base + chunkpos - 52);
+                    else
+#endif
                     for (k = 5; k < pool; k++)
                         w[k] += (int)(orig >= pred[base + chunkpos - k]
                                           ? orig - pred[base + chunkpos - k]
                                           : pred[base + chunkpos - k] - orig);
+                }
                 idx = (int)orig | ctx[0];
                 c = tab[0][idx];
                 if (c < thr) {
@@ -381,12 +443,19 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
                         }
                         ctx[i] = (int)d << 8;
                     }
-                    if (pool)
+                    if (pool) {
+#ifdef SBC_M0A_SIMD
+                        if (pool == 53)
+                            sbc_m0a_acc_add(&acc, w, orig,
+                                            pred + base + chunkpos - 52);
+                        else
+#endif
                         for (k = 5; k < pool; k++)
                             w[k] += (int)(orig >= pred[base + chunkpos - k]
                                               ? orig - pred[base + chunkpos - k]
                                               : pred[base + chunkpos - k] -
                                                     orig);
+                    }
                 }
                 idx = (int)orig | ctx[0];
                 c = tab[0][idx];
@@ -517,6 +586,9 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
                         : 0;
             int newslot = sbc_m0a_select(pp, tab, tabn, active, nmod, d,
                                          score, limit, &state);
+#ifdef SBC_M0A_SIMD
+            sbc_m0a_acc_flush(&acc, w);
+#endif
             if (pool)
                 newslot = sbc_m0a_pool(newslot, nmod, pool, w, lag);
             memset(score, 0, sizeof(score));

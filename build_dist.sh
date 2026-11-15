@@ -61,15 +61,16 @@ echo "=== Generating Release Notes ==="
 cat << EOF > "${DIST_DIR}/release_notes.md"
 ## SBC Archiver ${VERSION}
 
-Maintenance and performance release bringing significant compression speedups to the pure C reimplementation of historical SBC Archiver 0.970, while strictly preserving 100% bit-exact parity with the original 32-bit DOS reference archiver.
+Performance and optimization release further accelerating compression and checksum processing across all profiles (-m1, -m2, -m3) while maintaining 100% bit-exact compatibility with the original 32-bit DOS reference archiver.
 
 ### Performance Improvements
-- **Transform & Policy Caching**: Caches Mode 0, Mode 4, and Mode 6 filtered buffers and linecodes during policy evaluation, eliminating duplicate filtering runs during pipeline execution.
-- **BWT Reuse on Stored Fallback**: Direct reuse of the pipeline BWT array without re-sorting when a block falls back to stored mode (major speedup on high-entropy / incompressible streams).
-- **Fast Stage 2 Encoding**: Replaced per-step linear \`memchr\` lookups with symbol occurrence index arrays (\`occ\`) and monotonic forward cursors; added early abort when payload cannot beat raw length.
-- **Memory Pooling & Zero-Copy**: Reused scratch buffers and 64 KiB slot tables in Mode 0 (reducing memory allocations to a single memset per block); direct residual writes into destination buffers.
-- **64-bit SWAR & Vector Intrinsics**: 8-byte multi-byte loads (\`sbc_ld64\`), \`__builtin_bswap32\`, and \`__builtin_ctzll\` in BWT, LZP, and sub-compressor inner loops.
-- **Speedup Results**: ~ 1.30x to 1.53x faster encoding on code, binary, and high-entropy data.
+- **Fast Checksums (Slice-by-8 & Adler32)**: Table-driven reflected CRC16 and CRC32 processing 8 bytes per iteration, with deferred modulo reduction for Adler32 (benefiting both encoder and decoder).
+- **Stage 2 Range Coder Acceleration**: Backward occurrence array (\`nxt[]\`) replacing per-symbol cursor lookups with linear memory access; SSE2-vectorized rank scanning (8 integers per step); byte-buffered bit accumulation.
+- **Mode 0 Adaptive Filter Optimizations**:
+  - SSE2 vectorization for lag-weight scoring in -m3 and delta/context computation in batch mode.
+  - Branchless context-table updates (\`sbc_m0a_hit\`) eliminating branch mispredictions.
+  - Table-by-table batch processing (\`sbc_m0a_batch0\`) when copy slot is active, maximizing cache locality.
+- **Speedup Results**: ~ 1.15x to 1.50x faster encoding on text, structured records, and binaries.
 
 ### Release Assets
 - \`${TAR_NAME}\` : Standalone 64-bit Linux binary (\`sbc\`) + documentation

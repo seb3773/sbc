@@ -256,6 +256,173 @@ SBC_INLINE void sbc_m0a_acc_add(SbcM0Acc *acc, int *w, unsigned orig,
 }
 #endif
 
+/* One context-table hit, without a branch: the age cell is raised to
+ * max(c + 1, state) when it is older than `thr` (and the slot scores), else
+ * left alone.  `c < thr` is close to a coin flip on most data, so the
+ * branchy form mispredicted on a large share of the 11 hits per byte; the
+ * unconditional store writes back the same value when nothing changes. */
+SBC_INLINE int sbc_m0a_hit(unsigned char *cell, int thr, int state)
+{
+    int c = *cell;
+    int upd = c < thr;
+    int nv = c + 1 > state ? c + 1 : state;
+    *cell = (unsigned char)(upd ? nv : c);
+    return upd;
+}
+
+/* the per-lag slots 1..nmod for one byte (the vendor walks them downwards;
+ * the tables are distinct so the order does not matter, kept anyway) */
+SBC_INLINE void sbc_m0a_slots_n(unsigned char **tab, int *ctx, int *score,
+                                const int *lag, int nmod, unsigned orig,
+                                const unsigned char *pp, int thr, int state)
+{
+    int i;
+    unsigned d[11];
+    int u[11];
+    unsigned char *cell[11];
+    /* all addresses first: the table stores cannot alias the slot arrays,
+     * but the compiler has to assume they do, so read everything up
+     * front and write back at the end */
+    for (i = nmod; i >= 1; i--) {
+        d[i] = (unsigned char)(orig - pp[-lag[i]]);
+        cell[i] = &tab[i][(int)d[i] | ctx[i]];
+    }
+    for (i = nmod; i >= 1; i--)
+        u[i] = sbc_m0a_hit(cell[i], thr, state);
+    for (i = nmod; i >= 1; i--) {
+        score[i] += u[i];
+        ctx[i] = (int)d[i] << 8;
+    }
+}
+
+SBC_INLINE void sbc_m0a_slots(unsigned char **tab, int *ctx, int *score,
+                              const int *lag, int nmod, unsigned orig,
+                              const unsigned char *pp, int thr, int state)
+{
+    switch (nmod) {
+    case 10:
+        sbc_m0a_slots_n(tab, ctx, score, lag, 10, orig, pp, thr, state);
+        break;
+    case 6:
+        sbc_m0a_slots_n(tab, ctx, score, lag, 6, orig, pp, thr, state);
+        break;
+    case 3:
+        sbc_m0a_slots_n(tab, ctx, score, lag, 3, orig, pp, thr, state);
+        break;
+    default:
+        sbc_m0a_slots_n(tab, ctx, score, lag, nmod, orig, pp, thr, state);
+        break;
+    }
+}
+
+/* A stretch of `b` bytes at p0 with the copy slot running (active == 0).
+ * In that state nothing a byte does feeds back into the next one until the
+ * 257-byte checkpoint or the chunk end -- the third cut site only watches a
+ * real predictor, `thr`/`state` are fixed for the chunk -- so the work can
+ * be done table by table instead of byte by byte: each table still sees its
+ * hits in byte order, and the slots, the pool weights and the two scratch
+ * tables never share state.  The caller picks `b` so that the checkpoint,
+ * if any, falls on the last byte.  The output bytes need no write: with
+ * slot 0 the residual is the byte itself in both directions, which is what
+ * dst already holds (the initial copy), and that is also why reading `pred`
+ * inside the stretch is safe when decoding. */
+static void sbc_m0a_batch0(unsigned char **tab, int *ctx, int *score,
+                           const int *lag, int nmod, const unsigned char *src,
+                           const unsigned char *pred, size_t p0, size_t b,
+                           int thr, int state)
+{
+    const unsigned char *o = src + p0;
+    int i;
+    size_t j;
+#ifdef SBC_M0A_SIMD
+    /* the contexts first, 16 bytes at a time: dl[j + 1] is byte j's delta,
+     * dl[0] the one carried in from before the stretch, and the 16-bit
+     * context of byte j is dl[j] << 8 | dl[j + 1] (unpacklo of the shifted
+     * pair) */
+    unsigned char dl[0x101 + 48];
+    uint16_t ix[0x101 + 48];
+    for (i = nmod; i >= 1; i--) {
+        unsigned char *t = tab[i];
+        const unsigned char *q = pred + p0 - lag[i];
+        int sc = 0;
+        dl[0] = (unsigned char)(ctx[i] >> 8);
+        for (j = 0; j + 16 <= b; j += 16) {
+            __m128i vo = _mm_loadu_si128((const __m128i *)(o + j));
+            __m128i vq = _mm_loadu_si128((const __m128i *)(q + j));
+            _mm_storeu_si128((__m128i *)(dl + 1 + j), _mm_sub_epi8(vo, vq));
+        }
+        for (; j < b; j++) /* never read past the stretch: it can end the input */
+            dl[1 + j] = (unsigned char)(o[j] - q[j]);
+        for (j = 0; j < b; j += 16) {
+            __m128i cur = _mm_loadu_si128((const __m128i *)(dl + 1 + j));
+            __m128i prv = _mm_loadu_si128((const __m128i *)(dl + j));
+            _mm_storeu_si128((__m128i *)(ix + j), _mm_unpacklo_epi8(cur, prv));
+            _mm_storeu_si128((__m128i *)(ix + j + 8),
+                             _mm_unpackhi_epi8(cur, prv));
+        }
+        for (j = 0; j < b; j++)
+            sc += sbc_m0a_hit(&t[ix[j]], thr, state);
+        ctx[i] = (int)dl[b] << 8;
+        score[i] += sc;
+    }
+#else
+    for (i = nmod; i >= 1; i--) {
+        unsigned char *t = tab[i];
+        const unsigned char *q = pred + p0 - lag[i];
+        int cx = ctx[i], sc = 0;
+        for (j = 0; j < b; j++) {
+            unsigned d = (unsigned char)(o[j] - q[j]);
+            sc += sbc_m0a_hit(&t[(int)d | cx], thr, state);
+            cx = (int)d << 8;
+        }
+        ctx[i] = cx;
+        score[i] += sc;
+    }
+#endif
+    {
+        unsigned char *t = tab[0];
+        int cx = ctx[0], sc = 0;
+        for (j = 0; j < b; j++) {
+            sc += sbc_m0a_hit(&t[(int)o[j] | cx], thr, state);
+            cx = (int)o[j] << 8;
+        }
+        ctx[0] = cx;
+        score[0] += sc;
+    }
+}
+
+/* the two scratch tables over the same stretch (ctx[0] is the byte itself
+ * there, so table B's context is the current byte too) */
+static void sbc_m0a_batch0_scr(const unsigned char *src,
+                               const unsigned char *pred,
+                               const unsigned char *dst, size_t p0, size_t b,
+                               unsigned char *scrA, unsigned char *scrB,
+                               long *cntA, long *famA, long *cntB, long *famB)
+{
+    size_t j;
+    long ca = 0, cb = 0;
+    for (j = 0; j < b; j++) {
+        size_t p = p0 + j;
+        int hi = (int)src[p] << 8;
+        int idxA = (int)pred[p - 1] | hi;
+        int ia = scrA[idxA] < 3;
+        scrA[idxA] = (unsigned char)(scrA[idxA] + ia);
+        ca += ia;
+    }
+    for (j = 0; j < b; j++) {
+        size_t p = p0 + j;
+        int hi = (int)src[p] << 8;
+        int idxB = (int)dst[p - 1] | hi;
+        int ib = scrB[idxB] < 3;
+        scrB[idxB] = (unsigned char)(scrB[idxB] + ib);
+        cb += ib;
+    }
+    *cntA += ca;
+    *famA += (long)b - ca;
+    *cntB += cb;
+    *famB += (long)b - cb;
+}
+
 static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
                                       const SbcM0Params *pp, int enc,
                                       unsigned char *dst_in)
@@ -370,11 +537,42 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
             fprintf(stderr, "M0 chunk base=%zu limit=%d active=%d rem=%zu\n",
                     base, limit, active, remaining);
         while ((long)chunkpos < (long)limit) {
-            unsigned in = src[base + chunkpos];
+            unsigned in, orig = 0, resid = 0;
             int thr = (limit >> 11) + state;
-            unsigned orig, resid;
-            int idx, c;
+            int batched = 0;
             cut = 0;
+            if (active == 0) {
+                /* up to the next checkpoint or the chunk end */
+                size_t b = (size_t)limit - chunkpos;
+                size_t p0 = base + chunkpos;
+                if (b > (size_t)(0x101 - counter))
+                    b = (size_t)(0x101 - counter);
+                sbc_m0a_batch0(tab, ctx, score, lag, nmod, src, pred, p0, b,
+                               thr, state);
+                if (pool) {
+                    size_t j;
+                    for (j = 0; j < b; j++) {
+                        unsigned ob = src[p0 + j];
+#ifdef SBC_M0A_SIMD
+                        if (pool == 53)
+                            sbc_m0a_acc_add(&acc, w, ob, pred + p0 + j - 52);
+                        else
+#endif
+                        for (k = 5; k < pool; k++)
+                            w[k] += (int)(ob >= pred[p0 + j - k]
+                                              ? ob - pred[p0 + j - k]
+                                              : pred[p0 + j - k] - ob);
+                    }
+                }
+                if (scrA)
+                    sbc_m0a_batch0_scr(src, pred, dst, p0, b, scrA, scrB,
+                                       &cntA, &famA, &cntB, &famB);
+                chunkpos += b;
+                counter += (int)b;
+                batched = 1;
+                goto checkpoint;
+            }
+            in = src[base + chunkpos];
             if (enc) {
                 orig = in;
                 resid = active ? (unsigned char)(in - pred[base + chunkpos -
@@ -387,17 +585,8 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
                               : in;
             }
             if (active == 0) {
-                for (i = nmod; i >= 1; i--) {
-                    unsigned d = (unsigned char)(orig - pred[base + chunkpos -
-                                                             lag[i]]);
-                    idx = (int)d | ctx[i];
-                    c = tab[i][idx];
-                    if (c < thr) {
-                        tab[i][idx] = (unsigned char)(c < state ? state : c + 1);
-                        score[i]++;
-                    }
-                    ctx[i] = (int)d << 8;
-                }
+                sbc_m0a_slots(tab, ctx, score, lag, nmod, orig,
+                              pred + base + chunkpos, thr, state);
                 if (pool) {
 #ifdef SBC_M0A_SIMD
                     if (pool == 53)
@@ -410,39 +599,18 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
                                           ? orig - pred[base + chunkpos - k]
                                           : pred[base + chunkpos - k] - orig);
                 }
-                idx = (int)orig | ctx[0];
-                c = tab[0][idx];
-                if (c < thr) {
-                    tab[0][idx] = (unsigned char)(c < state ? state : c + 1);
-                    score[0]++;
-                }
+                score[0] += sbc_m0a_hit(&tab[0][(int)orig | ctx[0]], thr, state);
                 ctx[0] = (int)orig << 8;
             } else {
                 if (limit >= pp->minlen / 2) {
                     /* late in a long chunk the vendor only feeds the running
                      * slot (with its residual) and slot 0 */
-                    idx = (int)resid | ctx[active];
-                    c = tab[active][idx];
-                    if (c < thr) {
-                        tab[active][idx] =
-                            (unsigned char)(c < state ? state : c + 1);
-                        score[active]++;
-                    }
+                    score[active] += sbc_m0a_hit(
+                        &tab[active][(int)resid | ctx[active]], thr, state);
                     ctx[active] = (int)resid << 8;
                 } else {
-                    for (i = nmod; i >= 1; i--) {
-                        unsigned d = (unsigned char)(orig -
-                                                     pred[base + chunkpos -
-                                                          lag[i]]);
-                        idx = (int)d | ctx[i];
-                        c = tab[i][idx];
-                        if (c < thr) {
-                            tab[i][idx] =
-                                (unsigned char)(c < state ? state : c + 1);
-                            score[i]++;
-                        }
-                        ctx[i] = (int)d << 8;
-                    }
+                    sbc_m0a_slots(tab, ctx, score, lag, nmod, orig,
+                                  pred + base + chunkpos, thr, state);
                     if (pool) {
 #ifdef SBC_M0A_SIMD
                         if (pool == 53)
@@ -457,12 +625,7 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
                                                     orig);
                     }
                 }
-                idx = (int)orig | ctx[0];
-                c = tab[0][idx];
-                if (c < thr) {
-                    tab[0][idx] = (unsigned char)(c < state ? state : c + 1);
-                    score[0]++;
-                }
+                score[0] += sbc_m0a_hit(&tab[0][(int)orig | ctx[0]], thr, state);
                 ctx[0] = (int)orig << 8;
             }
             /* 0x425e93..0x425ee2: the third cut site, reached by both the
@@ -486,6 +649,7 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
             }
             chunkpos++;
             counter++;
+        checkpoint:
             if (counter > 0x100) {
                 int dact = score[active] - shadow[active];
                 if (active == 0 || limit < pp->minlen / 2) {
@@ -523,26 +687,26 @@ static unsigned char *sbc_m0_adaptive(const unsigned char *src, size_t n,
                 }
                 shadow[0] = score[0];
             }
+            if (batched) {
+                if (cut)
+                    break;
+                continue;
+            }
             if (scrA) {
                 /* FUN_0043cda6: the two scratch tables, one hit per byte */
                 size_t p = base + chunkpos - 1;
                 int prevb = p > 0 ? (int)pred[p - 1] : 0;
                 int idxA = prevb | ((int)orig << 8);
                 int idxB = (p > 0 ? (int)dst[p - 1] : 0) | ctx[active];
-                unsigned char ca = scrA[idxA];
-                unsigned char cb = scrB[idxB];
-                if (ca < 3) {
-                    scrA[idxA] = (unsigned char)(ca + 1);
-                    cntA++;
-                } else {
-                    famA++;
-                }
-                if (cb < 3) {
-                    scrB[idxB] = (unsigned char)(cb + 1);
-                    cntB++;
-                } else {
-                    famB++;
-                }
+                int ia = scrA[idxA] < 3;
+                int ib;
+                scrA[idxA] = (unsigned char)(scrA[idxA] + ia);
+                ib = scrB[idxB] < 3;
+                scrB[idxB] = (unsigned char)(scrB[idxB] + ib);
+                cntA += ia;
+                famA += 1 - ia;
+                cntB += ib;
+                famB += 1 - ib;
             }
             dst[base + chunkpos - 1] = (unsigned char)(enc ? resid : orig);
             if (cut)

@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_DIR="${SCRIPT_DIR}/build/pkg_root"
-VERSION="0.970.1-1"
+VERSION="0.970.2-1"
 ARCH="amd64"
 DEB_NAME="sbc_${VERSION}_${ARCH}.deb"
 
@@ -44,7 +44,7 @@ fi
 # DEBIAN/control
 cat << 'CTRL_EOF' > "${PKG_DIR}/DEBIAN/control"
 Package: sbc
-Version: 0.970.1-1
+Version: 0.970.2-1
 Section: utils
 Priority: optional
 Architecture: amd64

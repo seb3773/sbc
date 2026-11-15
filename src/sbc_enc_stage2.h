@@ -22,6 +22,10 @@
 #ifndef SBC_ENC_STAGE2_H
 #define SBC_ENC_STAGE2_H
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 /* ---- encoder-side adaptive model (mirror of SbcModel) ---- */
 
 typedef struct {
@@ -172,20 +176,22 @@ static void sbc_enc_push_byte(SbcEncCtx *c, uint8_t v)
     c->bits[c->nbits++] = v;
 }
 
-static void sbc_enc_bit(SbcEncCtx *c, unsigned b)
-{
-    c->acc = (c->acc << 1) | (b & 1u);
-    if (++c->accn == 8) {
-        sbc_enc_push_byte(c, (uint8_t)c->acc);
-        c->acc = 0;
-        c->accn = 0;
-    }
-}
-
 static void sbc_enc_bits(SbcEncCtx *c, uint32_t nbits, uint32_t v)
 {
-    while (nbits--)
-        sbc_enc_bit(c, (v >> nbits) & 1u);
+    /* same MSB-first packing as nbits sbc_enc_bit() calls, a byte at a
+     * time; acc only ever holds the accn pending bits */
+    while (nbits) {
+        uint32_t room = 8u - c->accn;
+        uint32_t take = nbits < room ? nbits : room;
+        nbits -= take;
+        c->acc = (c->acc << take) | ((v >> nbits) & ((1u << take) - 1u));
+        c->accn += take;
+        if (c->accn == 8) {
+            sbc_enc_push_byte(c, (uint8_t)c->acc);
+            c->acc = 0;
+            c->accn = 0;
+        }
+    }
 }
 
 static void sbc_enc_ctx_free(SbcEncCtx *c)
@@ -391,6 +397,35 @@ static uint32_t sbc_enc_model_index(uint32_t state)
     return (uint32_t)SBC_T360[2 + sbc_logmap(a)];
 }
 
+/* Index of the last pos[] entry below T, scanning from pos[1] (the caller
+ * guarantees pos[1] < T <= pos[M], pos[M] being the sentinel n, and pos[]
+ * holding at least 8 readable slots past M). */
+SBC_INLINE uint32_t sbc_enc_rank(const uint32_t *pos, uint32_t T)
+{
+#if defined(__SSE2__)
+    const __m128i t = _mm_set1_epi32((int)T);
+    uint32_t i = 1;
+    /* positions are < 2^31, so the signed compare is exact */
+    for (;;) {
+        __m128i a = _mm_loadu_si128((const __m128i *)(pos + i));
+        __m128i b = _mm_loadu_si128((const __m128i *)(pos + i + 4));
+        unsigned ma = (unsigned)_mm_movemask_ps(
+            _mm_castsi128_ps(_mm_cmplt_epi32(a, t)));
+        unsigned mb = (unsigned)_mm_movemask_ps(
+            _mm_castsi128_ps(_mm_cmplt_epi32(b, t)));
+        unsigned m = ma | (mb << 4);
+        if (m != 0xFFu)
+            return i + (uint32_t)__builtin_ctz(~m) - 1;
+        i += 8;
+    }
+#else
+    uint32_t i = 1;
+    while (pos[i + 1] < T)
+        i++;
+    return i;
+#endif
+}
+
 /* Builds the payload for a stage2 input S of n bytes into `out`: range-coded
  * stream from the front, raw bits packed MSB-first then reversed at the back.
  * Returns 0 on success. */
@@ -402,7 +437,7 @@ static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n,
     uint32_t *pos = NULL;
     uint32_t *occ = NULL;
     uint32_t M;
-    int rc = -1, i;
+    int rc = -1;
     static const char *t2dbg;
     static int t2dbg_ready;
     if (n == 0)
@@ -412,7 +447,7 @@ static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n,
     sbc_wrc_init(&wrc, out);
     if (sbc_enc_ctx_init(&ctx, n, &wrc) != 0)
         return -1;
-    pos = (uint32_t *)calloc(512, sizeof(uint32_t));
+    pos = (uint32_t *)calloc(512 + 16, sizeof(uint32_t));
     if (!pos) {
         sbc_enc_ctx_free(&ctx);
         return -1;
@@ -423,23 +458,23 @@ static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n,
     {
         uint32_t outn = 0, threshold = 0x2000000u;
         long it = 0, itcap = 200000L + 8L * (long)n;
-        uint32_t occ_cnt[256];
-        uint32_t occ_off[257];
-        uint32_t occ_cur[256];
-        uint32_t oi, b;
+        uint32_t last[256];
+        uint32_t oi;
+        /* nxt[i]: the next position after i holding the same byte, or n.
+         * The frontier invariant makes S[pos[0] .. pos[1]-1] one run of
+         * `prev`, so "the next occurrence of prev after pos[1]" is
+         * nxt[pos[1] - 1] (one more hop if that lands on pos[1] itself).
+         * nxt is read at a non-decreasing index, unlike the 256 per-symbol
+         * cursors of a counting-sorted occurrence list. */
         occ = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
         if (!occ)
             goto done;
-        memset(occ_cnt, 0, sizeof(occ_cnt));
-        for (oi = 0; oi < n; oi++)
-            occ_cnt[S[oi]]++;
-        occ_off[0] = 0;
-        for (b = 0; b < 256; b++)
-            occ_off[b + 1] = occ_off[b] + occ_cnt[b];
-        memcpy(occ_cnt, occ_off, sizeof(occ_cnt));
-        memcpy(occ_cur, occ_off, sizeof(occ_cur));
-        for (oi = 0; oi < n; oi++)
-            occ[occ_cnt[S[oi]]++] = oi;
+        for (oi = 0; oi < 256; oi++)
+            last[oi] = n;
+        for (oi = n; oi-- > 0;) {
+            occ[oi] = last[S[oi]];
+            last[S[oi]] = oi;
+        }
         for (;;) {
             uint32_t d1, prev, prevsym, state, aidx, t, esi;
             int64_t gap, nd;
@@ -469,8 +504,7 @@ static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n,
                     rc = 0;
                     break;
                 }
-                for (i = 1; i < (int)M; i++)
-                    pos[i - 1] = pos[i];
+                memmove(pos, pos + 1, (size_t)(M - 1) * sizeof(*pos));
                 M -= 1;
                 pos[M] = n;
                 continue;
@@ -478,17 +512,24 @@ static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n,
             prevsym = S[outn - 1];
             state = ctx.map[prevsym];
             aidx = sbc_enc_model_index(state);
-            /* next occurrence of prev strictly after pos[1]; d1 is
-             * non-decreasing so each symbol's cursor only walks forward */
+            /* next occurrence of prev strictly after pos[1] */
             {
-                uint32_t lo = occ_cur[prev];
-                uint32_t hi = occ_off[prev + 1];
-                while (lo < hi && occ[lo] <= d1)
-                    lo++;
-                occ_cur[prev] = lo;
-                if (lo < hi) {
+                uint32_t nx;
+                if (SBC_LIKELY(d1 > 0 && S[d1 - 1] == prev)) {
+                    nx = occ[d1 - 1];
+                    if (nx == d1)
+                        nx = occ[d1];
+                } else {
+                    /* not reachable while the frontier invariant holds;
+                     * kept as a plain scan so the result never depends on
+                     * it */
+                    nx = d1 + 1;
+                    while (nx < n && S[nx] != prev)
+                        nx++;
+                }
+                if (nx < n) {
                     have_T = 1;
-                    T = occ[lo];
+                    T = nx;
                 }
             }
             if (!have_T) {
@@ -497,17 +538,11 @@ static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n,
                 esi = 0x2000000u;
             } else {
                 uint32_t v, idx, bv, lo_bits = 0, nbits = 0;
-                {
-                    uint32_t l = 0, h = (uint32_t)M + 1, m;
-                    while (l < h) {
-                        m = l + (h - l) / 2;
-                        if (pos[m] < T)
-                            l = m + 1;
-                        else
-                            h = m;
-                    }
-                    K = l - 1;
-                }
+                /* K + 1 = number of frontier entries below T.  pos[] is
+                 * sorted, pos[1] = d1 < T and pos[M] = n > T, and K is
+                 * small on average, so a forward scan beats the binary
+                 * search's unpredictable branches. */
+                K = sbc_enc_rank(pos, T);
                 esi = T - pos[1] - K;
                 if (esi >= n)
                     goto done;
@@ -562,16 +597,13 @@ static int sbc_enc_stage2_payload(SbcBuf *out, const uint8_t *S, uint32_t n,
                     rc = 0;
                     break;
                 }
-                for (i = 1; i < (int)M; i++)
-                    pos[i - 1] = pos[i];
+                memmove(pos, pos + 1, (size_t)(M - 1) * sizeof(*pos));
                 M -= 1;
                 pos[M] = n;
                 continue;
             }
             /* shift + insert at index K */
-            pos[0] = pos[1];
-            for (i = 1; i < (int)K; i++)
-                pos[i] = pos[i + 1];
+            memmove(pos, pos + 1, (size_t)K * sizeof(*pos));
             pos[K] = T;
         }
     }
